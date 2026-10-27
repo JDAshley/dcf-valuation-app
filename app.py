@@ -19,8 +19,22 @@ import pandas as pd
 import requests
 import streamlit as st
 import streamlit.components.v1 as components
+from PIL import Image
 
-st.set_page_config(page_title="DCF Valuation App", page_icon="📈", layout="wide")
+APP_ICON_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets", "jd-dcf-model-icon.png")
+
+
+def _page_icon():
+    """The JD-DCF icon, scaled down for use as a favicon; falls back to an emoji if the file is missing."""
+    try:
+        with Image.open(APP_ICON_PATH) as img:
+            img.load()
+            return img.convert("RGB").resize((192, 192), Image.LANCZOS)
+    except OSError:
+        return "📈"
+
+
+st.set_page_config(page_title="JD-DCF Model", page_icon=_page_icon(), layout="wide")
 
 CACHE_TTL = 24 * 60 * 60  # 24 hours
 FOOTER = "For education only. Not financial advice."
