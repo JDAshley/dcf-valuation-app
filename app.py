@@ -8,8 +8,11 @@ For education only. Not financial advice.
 
 from __future__ import annotations
 
+import base64
 import datetime as dt
+import functools
 import html
+import io
 import json
 import math
 import os
@@ -35,6 +38,53 @@ def _page_icon():
 
 
 st.set_page_config(page_title="JD-DCF Model", page_icon=_page_icon(), layout="wide")
+
+
+@functools.lru_cache(maxsize=1)
+def _logo_data_uri() -> str | None:
+    """The logo as a 192px PNG data URI (sharp at 64px on high-DPI screens), or None if unavailable."""
+    try:
+        with Image.open(APP_ICON_PATH) as img:
+            buf = io.BytesIO()
+            img.convert("RGB").resize((192, 192), Image.LANCZOS).save(buf, format="PNG", optimize=True)
+    except OSError:
+        return None
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+HEADER_CSS = """
+<style>
+.jd-header {
+    position: relative; box-sizing: border-box; min-height: 64px;
+    display: flex; flex-direction: column; justify-content: center;
+    padding: 0.35rem 96px 0.35rem 0;
+}
+.jd-header .jd-brand {
+    color: #b38b22; font-size: 0.8rem; font-weight: 700; letter-spacing: 0.14em;
+    text-transform: uppercase; line-height: 1.2;
+}
+.jd-header h1.jd-title {
+    margin: 0; padding: 0; font-size: 2.5rem; font-weight: 700; line-height: 1.15; color: inherit;
+}
+.jd-header .jd-logo {
+    position: absolute; right: 0; top: 50%; transform: translateY(-50%);
+    width: 64px; height: 64px; border-radius: 12px; opacity: 1;
+}
+@media (max-width: 767px) {
+    .jd-header { padding: 0.45rem 64px 0.45rem 0; }
+    .jd-header h1.jd-title { font-size: 2rem; }
+    .jd-header .jd-logo { width: 46px; height: 46px; border-radius: 9px; }
+}
+</style>
+"""
+
+
+def render_header() -> None:
+    """Compact page header: gold brand line and title on the left, JD logo on the right."""
+    logo = _logo_data_uri()
+    logo_html = f'<img class="jd-logo" src="{logo}" alt="JD-DCF Model logo">' if logo else ""
+    st.html(f'{HEADER_CSS}<div class="jd-header"><div class="jd-brand">JD-DCF MODEL</div>'
+            f'<h1 class="jd-title">DCF Valuation</h1>{logo_html}</div>')
 
 CACHE_TTL = 24 * 60 * 60  # 24 hours
 FOOTER = "For education only. Not financial advice."
@@ -1605,7 +1655,7 @@ def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
 
 def main() -> str | None:
     """Render the app. Returns the ticker whose inputs should be saved, if any."""
-    st.title("📈 DCF Valuation App")
+    render_header()
 
     # Saved inputs live in the browser, which reports them a moment after the
     # first run. Wait for them so widgets start from saved values, not defaults.
