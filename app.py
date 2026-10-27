@@ -9,6 +9,7 @@ For education only. Not financial advice.
 from __future__ import annotations
 
 import datetime as dt
+import html
 import json
 import math
 import os
@@ -633,6 +634,115 @@ ASSUMPTION_CSS = """
 """
 
 
+# Phones (< 768px) get compact two-column tiles; desktop keeps the Streamlit metric rows.
+# Colours are translucent greys over the inherited text colour, so tiles suit light and dark themes.
+MOBILE_CSS = """
+<style>
+/* Hide the inactive variant together with its layout wrapper, so it leaves no gap. */
+.st-key-mob_header, .st-key-mob_snapshot, .st-key-mob_dcf, .st-key-mob_chart,
+[data-testid="stLayoutWrapper"]:has(> .st-key-mob_header),
+[data-testid="stLayoutWrapper"]:has(> .st-key-mob_snapshot),
+[data-testid="stLayoutWrapper"]:has(> .st-key-mob_dcf),
+[data-testid="stLayoutWrapper"]:has(> .st-key-mob_chart) { display: none !important; }
+@media (max-width: 767px) {
+    .st-key-desk_header, .st-key-desk_snapshot, .st-key-desk_dcf, .st-key-desk_chart,
+    [data-testid="stLayoutWrapper"]:has(> .st-key-desk_header),
+    [data-testid="stLayoutWrapper"]:has(> .st-key-desk_snapshot),
+    [data-testid="stLayoutWrapper"]:has(> .st-key-desk_dcf),
+    [data-testid="stLayoutWrapper"]:has(> .st-key-desk_chart) { display: none !important; }
+    .st-key-mob_header, .st-key-mob_snapshot, .st-key-mob_dcf, .st-key-mob_chart { display: flex !important; }
+    [data-testid="stLayoutWrapper"]:has(> .st-key-mob_header),
+    [data-testid="stLayoutWrapper"]:has(> .st-key-mob_snapshot),
+    [data-testid="stLayoutWrapper"]:has(> .st-key-mob_dcf),
+    [data-testid="stLayoutWrapper"]:has(> .st-key-mob_chart) { display: flex !important; }
+}
+/* Desktop chart legend: one centred row; if it must wrap, two balanced rows of four. */
+.chart-legend {
+    display: flex; flex-wrap: wrap; justify-content: center; gap: 0.4rem 0.75rem;
+    font-size: 0.72rem; line-height: 1.2; margin-top: -0.5rem;
+}
+.chart-legend .half { display: flex; flex-wrap: wrap; justify-content: center; gap: 0.4rem 0.75rem; }
+.chart-legend .item { display: inline-flex; align-items: center; gap: 0.3rem; white-space: nowrap; }
+/* Swatches are CSS-drawn: st.html's sanitizer strips inline SVG. */
+.chart-legend .sw { flex: none; width: 14px; height: 14px; border-radius: 2px; }
+.chart-legend .dot { flex: none; width: 12px; height: 12px; border-radius: 50%; border: 1.5px solid #78633f; }
+.chart-legend .eps-line { flex: none; position: relative; width: 36px; height: 14px; }
+.chart-legend .eps-line .dash { position: absolute; left: 0; right: 0; top: 6px; border-top: 2.5px dashed; }
+.chart-legend .eps-line .ring {
+    position: absolute; left: 12px; top: 1px; width: 12px; height: 12px; box-sizing: border-box;
+    border-radius: 50%; border: 2.5px solid; background: transparent;
+}
+.tile-grid {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 0.5rem;
+    width: 100%;
+}
+.tile {
+    min-width: 0;
+    min-height: 4.4rem;
+    box-sizing: border-box;
+    padding: 0.6rem 0.75rem;
+    border: 1px solid rgba(128, 128, 128, 0.30);
+    border-radius: 0.6rem;
+    background: rgba(128, 128, 128, 0.08);
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 0.15rem;
+}
+.tile.wide { grid-column: 1 / -1; }
+.tile.emph { border-color: rgba(59, 130, 246, 0.60); background: rgba(59, 130, 246, 0.12); }
+.tile .lbl {
+    font-size: 0.78rem; line-height: 1.2; opacity: 0.75;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tile .val {
+    font-size: 1.3rem; font-weight: 600; line-height: 1.25; font-variant-numeric: tabular-nums;
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.tile.emph .val { font-size: 1.75rem; }
+.tile .delta { font-size: 0.82rem; font-weight: 600; }
+.tile .delta.up { color: #16a34a; }
+.tile .delta.down { color: #dc2626; }
+</style>
+"""
+
+
+def desktop_legend_html() -> str:
+    """HTML legend for the desktop chart, matching the trace colours and EPS line styles."""
+    def square(color):
+        return f'<span class="sw" style="background-color: {color}"></span>'
+
+    eps_actual = f'<span class="dot" style="background-color: {EPS_COLORS[0]}"></span>'
+    eps_projected = (f'<span class="eps-line" style="color: {EPS_COLORS[1]}">'
+                     '<span class="dash"></span><span class="ring"></span></span>')
+    entries = [
+        ("Actual Revenue", square(ACTUAL_COLORS[0])), ("Projected Revenue", square(PROJECTED_COLORS[0])),
+        ("Actual Adj. EBITDA", square(ACTUAL_COLORS[1])), ("Projected Adj. EBITDA", square(PROJECTED_COLORS[1])),
+        ("Actual Free Cash Flow", square(ACTUAL_COLORS[2])), ("Projected Free Cash Flow", square(PROJECTED_COLORS[2])),
+        ("Actual EPS (diluted)", eps_actual), ("Projected EPS (diluted, dashed)", eps_projected),
+    ]
+    items = [f'<span class="item">{icon}<span>{html.escape(label)}</span></span>' for label, icon in entries]
+    return (f'<div class="chart-legend"><div class="half">{"".join(items[:4])}</div>'
+            f'<div class="half">{"".join(items[4:])}</div></div>')
+
+
+def tile_grid(tiles: list[tuple]) -> str:
+    """HTML for a two-column tile grid. Each tile: (label, value[, css class[, delta %]])."""
+    cells = []
+    for label, value, *rest in tiles:
+        cls = rest[0] if rest else ""
+        delta = rest[1] if len(rest) > 1 else None
+        delta_html = ""
+        if delta is not None:
+            delta_html = (f'<span class="delta {"up" if delta >= 0 else "down"}">'
+                          f'{html.escape(fmt_pct(delta, signed=True))} vs current</span>')
+        cells.append(f'<div class="tile {cls}"><span class="lbl">{html.escape(label)}</span>'
+                     f'<span class="val">{html.escape(value)}</span>{delta_html}</div>')
+    return f'<div class="tile-grid">{"".join(cells)}</div>'
+
+
 def fade(start: float, n: int) -> list[float]:
     """n growth rates moving linearly from `start` toward LONG_RUN_GROWTH."""
     return [start + (LONG_RUN_GROWTH - start) * k / (n + 1) for k in range(1, n + 1)]
@@ -913,16 +1023,27 @@ def model_chart(labels: list[str], base: dict, proj: list[dict], eps: list):
             [p[k] / 1e9 for p in proj for k in ("revenue", "ebitda", "fcf")]
     y1, y2 = _zero_aligned_ranges(money, [base["eps"]] + eps)
     fig.add_vline(x=0.5, line_dash="dash", line_color="#9ca3af")
-    fig.add_annotation(x=0.5, y=1.06, yref="paper", text="Projections begin →", showarrow=False,
-                       xanchor="left", font=dict(size=12))
+    fig.add_annotation(x=0.5, y=1.0, yref="paper", yanchor="bottom", text="Projections begin →",
+                       showarrow=False, xanchor="left", font=dict(size=11))
+    axis_font = dict(size=10)
     fig.update_layout(
-        barmode="group", height=440, margin=dict(t=40, b=10, l=10, r=10),
-        yaxis=dict(title="USD billions", range=y1, zeroline=True, zerolinecolor="#6b7280"),
-        yaxis2=dict(title="EPS ($)", overlaying="y", side="right", range=y2, showgrid=False,
-                    zeroline=True, zerolinecolor="#6b7280", tickformat="$,.2f"),
-        legend=dict(groupclick="toggleitem", x=1.08),
+        barmode="group", height=440, margin=dict(t=28, b=8, l=6, r=6),
+        dragmode=False,
+        xaxis=dict(fixedrange=True, tickangle=0, tickfont=axis_font, automargin=True),
+        yaxis=dict(title=dict(text="USD billions", font=dict(size=11), standoff=4), range=y1, zeroline=True,
+                   zerolinecolor="#6b7280", fixedrange=True, tickfont=axis_font, automargin=True),
+        yaxis2=dict(title=dict(text="EPS ($)", font=dict(size=11), standoff=4), overlaying="y", side="right",
+                    range=y2, showgrid=False, zeroline=True, zerolinecolor="#6b7280", tickformat="$,.2f",
+                    fixedrange=True, tickfont=axis_font, automargin=True),
+        # Legend below the plot, one row per group (Actual / Projected).
+        legend=dict(orientation="h", x=0, xanchor="left", y=-0.17, yanchor="top", font=dict(size=11),
+                    groupclick="toggleitem", tracegroupgap=4, entrywidth=0, itemsizing="constant"),
     )
     return fig
+
+
+# No modebar, no zoom/pan: a touch-drag over the chart scrolls the page. Hover still works.
+CHART_CONFIG = {"displayModeBar": False, "scrollZoom": False, "doubleClick": False, "responsive": True}
 
 
 # --------------------------------------------------------------------------- #
@@ -995,7 +1116,7 @@ def lookup_cik(ticker: str) -> int | None:
     return int(hit.iloc[0]["cik_str"]) if not hit.empty else None
 
 
-def render_snapshot(m: dict, fcf_for_yield: float | None) -> None:
+def render_snapshot(m: dict, fcf_for_yield: float | None, price) -> None:
     st.header("Valuation Snapshot")
     eps_neg = m["eps_ttm"] is not None and m["eps_ttm"] <= 0
     items = [
@@ -1012,10 +1133,16 @@ def render_snapshot(m: dict, fcf_for_yield: float | None) -> None:
         items.append(("Dividend Yield", fmt_pct(m["div_yield"])))
     else:
         items.append(("Dividend Yield", "None"))
-    for start in range(0, len(items), 5):
-        cols = st.columns(5)
-        for col, (label, value) in zip(cols, items[start:start + 5]):
-            col.metric(label, value)
+    with st.container(key="desk_snapshot"):
+        for start in range(0, len(items), 5):
+            cols = st.columns(5)
+            for col, (label, value) in zip(cols, items[start:start + 5]):
+                col.metric(label, value)
+    with st.container(key="mob_snapshot"):
+        tiles = [("Current price", fmt_price(price)), ("Market cap", fmt_money(m["market_cap"]))]
+        tiles += [("PEG ratio" if label == "PEG" else label, value) for label, value in items[:-1]]
+        tiles.append((items[-1][0], items[-1][1], "wide"))  # Dividend Yield spans both columns
+        st.html(tile_grid(tiles))
     st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable.")
 
 
@@ -1032,7 +1159,7 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> l
         st.warning("Base-year Adjusted EBITDA is negative. The Adjusted EBITDA → FCF bridge (FCF conversion %) is unreliable "
                    "for this company; treat the projected FCF and DCF with caution.")
     for note in base["notes"]:
-        st.caption(note)
+        st.caption(md_escape(note))
 
     # Seed every box (saved value first, else default) before any widget is created.
     for i in range(YEARS):
@@ -1084,6 +1211,7 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> l
     eps = project_eps(base["eps"], base["ebitda"], proj, defaults["eps"])
 
     labels = [f"{base['label']} Actual"] + [f"{y}E" for y in years]
+    chart_labels = [f"{base['label']}<br>Actual"] + labels[1:]  # two-line label keeps ticks horizontal
     base_margin = safe_div(base["ebitda"], base["revenue"])
     table = pd.DataFrame(
         {
@@ -1100,7 +1228,17 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> l
                f"Actual FCF = operating cash flow − capex. Actual Adjusted EBITDA: {base['ebitda_source']}. "
                f"Actual EPS: {base['eps_source']}.")
     try:
-        st.plotly_chart(model_chart(labels, base, proj, eps), width="stretch")
+        import plotly.graph_objects as go
+
+        fig = model_chart(chart_labels, base, proj, eps)
+        # Desktop: same figure without Plotly's grouped legend, plus a horizontal HTML legend.
+        with st.container(key="desk_chart"):
+            st.plotly_chart(go.Figure(fig).update_layout(showlegend=False), width="stretch",
+                            config=CHART_CONFIG, key="chart_desktop")
+            st.html(desktop_legend_html())
+        # Phones: the figure as is, with its grouped legend below the plot.
+        with st.container(key="mob_chart"):
+            st.plotly_chart(fig, width="stretch", config=CHART_CONFIG, key="chart_mobile")
     except ImportError:
         st.warning("Install plotly (`pip install plotly`) to see the chart.")
     st.caption(eps_caption(defaults, years, eps, base))
@@ -1163,19 +1301,30 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
         index=[f"{y}E" for y in years],
     ).T, width="stretch")
 
-    cols = st.columns(4)
-    cols[0].metric("Sum of PV (FCF)", fmt_money(sum(r["pv_flows"])))
-    cols[1].metric("Terminal value (PV)", fmt_money(r["pv_tv"]), help=f"Undiscounted: {fmt_money(r['tv'])}")
-    cols[2].metric("Enterprise value", fmt_money(r["ev"]))
-    cols[3].metric("Net debt", fmt_money(net_debt or 0.0))
-    cols = st.columns(4)
-    cols[0].metric("Equity value", fmt_money(r["equity"]))
-    cols[1].metric("Shares outstanding", f"{shares / 1e6:,.1f}M")
     implied = r["price"]
     up = upside(implied, price)
-    cols[2].metric("Implied price", fmt_price(implied),
-                   delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
-    cols[3].metric("Current price", fmt_price(price))
+    with st.container(key="desk_dcf"):
+        cols = st.columns(4)
+        cols[0].metric("Sum of PV (FCF)", fmt_money(sum(r["pv_flows"])))
+        cols[1].metric("Terminal value (PV)", fmt_money(r["pv_tv"]), help=f"Undiscounted: {fmt_money(r['tv'])}")
+        cols[2].metric("Enterprise value", fmt_money(r["ev"]))
+        cols[3].metric("Net debt", fmt_money(net_debt or 0.0))
+        cols = st.columns(4)
+        cols[0].metric("Equity value", fmt_money(r["equity"]))
+        cols[1].metric("Shares outstanding", f"{shares / 1e6:,.1f}M")
+        cols[2].metric("Implied price", fmt_price(implied),
+                       delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
+        cols[3].metric("Current price", fmt_price(price))
+    with st.container(key="mob_dcf"):
+        st.html(tile_grid([
+            ("Sum of PV of projected FCF", fmt_money(sum(r["pv_flows"]))),
+            ("PV of terminal value", fmt_money(r["pv_tv"])),
+            ("Enterprise value", fmt_money(r["ev"])),
+            ("Equity value", fmt_money(r["equity"])),
+            ("Net debt", fmt_money(net_debt or 0.0)),
+            ("Shares outstanding", f"{shares / 1e6:,.1f}M"),
+            (f"Implied price (current {fmt_price(price)})", fmt_price(implied), "wide emph", up),
+        ]))
     tv_share = r["pv_tv"] / r["ev"] if r["ev"] > 0 else None
     if tv_share is not None and tv_share > 0.75:
         st.info(f"Terminal value is {tv_share:.0%} of enterprise value — the result is very sensitive "
@@ -1521,12 +1670,16 @@ def main() -> str | None:
 
     # ---- 1. Header
     name = m["name"] or edgar.get("name") or ticker
+    st.html(MOBILE_CSS)  # style-only HTML takes no space in the layout
     st.subheader(f"{name} ({ticker})")
-    cols = st.columns(4)
-    cols[0].metric("Sector", m["sector"] or "N/A")
-    cols[1].metric("Industry", m["industry"] or "N/A")
-    cols[2].metric("Current price", fmt_price(price))
-    cols[3].metric("Market cap", fmt_money(m["market_cap"]))
+    with st.container(key="desk_header"):
+        cols = st.columns(4)
+        cols[0].metric("Sector", m["sector"] or "N/A")
+        cols[1].metric("Industry", m["industry"] or "N/A")
+        cols[2].metric("Current price", fmt_price(price))
+        cols[3].metric("Market cap", fmt_money(m["market_cap"]))
+    with st.container(key="mob_header"):
+        st.markdown(f"**{m['sector'] or 'N/A'}** · {m['industry'] or 'N/A'}")
     caption = f"Market data: {source}. Fundamentals: SEC EDGAR."
     if m["currency"] and m["currency"] != "USD":
         caption += f" ⚠️ Quote currency is {m['currency']}; EDGAR figures are USD."
@@ -1546,7 +1699,7 @@ def main() -> str | None:
 
     # ---- 2. Snapshot
     fcf_for_yield = num(m["fcf_ttm"]) if m["fcf_ttm"] is not None else base["fcf"]
-    render_snapshot(m, fcf_for_yield)
+    render_snapshot(m, fcf_for_yield, price)
 
     # ---- 3. Projection model (1 actual year + 5 projected years)
     years = [base["end"].year + i for i in range(1, YEARS + 1)]
