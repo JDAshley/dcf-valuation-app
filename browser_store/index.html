@@ -1,0 +1,57 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"></head>
+<body>
+<!--
+  browser_store: a tiny Streamlit component that persists app inputs in the
+  viewer's own browser (localStorage), so nothing is stored on the server.
+
+  Python sends {writes: {key: string | null}}; null deletes the key.
+  The component applies the writes, then reports every "dcf_" key back as
+  {available, items}. It only reports when storage actually changed, so a
+  save triggers exactly one rerun and never loops.
+-->
+<script>
+  const PREFIX = "dcf_";
+  let lastSent = null;
+
+  function post(type, data) {
+    window.parent.postMessage(Object.assign({ isStreamlitMessage: true, type: type }, data), "*");
+  }
+
+  function snapshot() {
+    const items = {};
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith(PREFIX)) items[k] = localStorage.getItem(k);
+      }
+      return { available: true, items: items };
+    } catch (e) {
+      // Storage blocked (e.g. some private-browsing modes): the app keeps working, unsaved.
+      return { available: false, items: {} };
+    }
+  }
+
+  window.addEventListener("message", function (event) {
+    if (!event.data || event.data.type !== "streamlit:render") return;
+    const writes = (event.data.args && event.data.args.writes) || {};
+    try {
+      for (const [k, v] of Object.entries(writes)) {
+        if (!k.startsWith(PREFIX)) continue;
+        if (v === null) localStorage.removeItem(k);
+        else localStorage.setItem(k, v);
+      }
+    } catch (e) { /* reported as unavailable by snapshot() */ }
+    const snap = JSON.stringify(snapshot());
+    if (snap !== lastSent) {
+      lastSent = snap;
+      post("streamlit:setComponentValue", { value: JSON.parse(snap), dataType: "json" });
+    }
+  });
+
+  post("streamlit:componentReady", { apiVersion: 1 });
+  post("streamlit:setFrameHeight", { height: 0 });
+</script>
+</body>
+</html>
