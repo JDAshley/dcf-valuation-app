@@ -342,6 +342,7 @@ def edgar_fundamentals(cik: int) -> dict:
     ])
     op_income = annual_flow(facts, ["OperatingIncomeLoss"])
     sbc = annual_flow(facts, ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"])
+    diluted_shares = annual_flow(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"], unit="shares")
     eps_diluted = annual_flow(facts, ["EarningsPerShareDiluted", "EarningsPerShareBasicAndDiluted"],
                               unit="USD/shares")
     dna = annual_flow(facts, [
@@ -378,6 +379,7 @@ def edgar_fundamentals(cik: int) -> dict:
             "Free Cash Flow": (o - c) if o is not None and c is not None else None,
             "EBITDA": (oi + da) if oi is not None and da is not None else None,
             "EPS (diluted)": at(eps_diluted, d),
+            "Diluted shares": at(diluted_shares, d),
             "Stock-Based Compensation": at(sbc, d),
             "Cash": at(cash, d),
             "Total Debt": at(debt, d),
@@ -521,6 +523,7 @@ def fmp_market_data(symbol: str, api_key: str) -> dict:
         "annual": [
             {"date": str(i.get("date", "")), "source": "Financial Modeling Prep", "ebitda": num(i.get("ebitda")),
              "ebitda_norm": None, "eps_diluted": num(_pick(i, "epsDiluted", "epsdiluted")),
+             "diluted_shares": num(_pick(i, "weightedAverageShsOutDil")),
              "sbc": sbc_by_date.get(str(i.get("date", "")))}
             for i in (income if isinstance(income, list) else []) if isinstance(i, dict)
         ],
@@ -586,7 +589,8 @@ def _yf_periods(ticker, quarterly: bool) -> list[dict]:
     return [
         {"date": pd.Timestamp(col).date().isoformat(), "source": "yfinance",
          "ebitda": get(inc, "EBITDA", col), "ebitda_norm": get(inc, "Normalized EBITDA", col),
-         "eps_diluted": get(inc, "Diluted EPS", col), "sbc": get(cf, "Stock Based Compensation", col),
+         "eps_diluted": get(inc, "Diluted EPS", col), "diluted_shares": get(inc, "Diluted Average Shares", col),
+         "sbc": get(cf, "Stock Based Compensation", col),
          "fcf": get(cf, "Free Cash Flow", col)}
         for col in inc.columns
     ]
@@ -1241,7 +1245,7 @@ def render_snapshot(m: dict, fcf_for_yield: float | None, price) -> None:
     st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable.")
 
 
-def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_rows: list[dict],
+def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_rows: list[dict] | None,
                  market_cap) -> tuple[list[dict], list, list | None] | None:
     """Assumption boxes, SBC projection, calculated table and bar chart.
     Returns (projected years, projected EPS, projected SBC $ per year or None)."""
@@ -1310,7 +1314,11 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
     conversion = st.session_state[input_key(ticker, "conv")]
     proj = project(base["revenue"], growth, margin, conversion)
     eps = project_eps(base["eps"], base["ebitda"], proj, defaults["eps"])
-    sbc = render_sbc(ticker, base, years, proj, sbc_rows, market_cap)
+    if sbc_rows is None:  # gated: not a software company under $20B
+        st.caption(SBC_GATE_NOTE)
+        sbc = None
+    else:
+        sbc = render_sbc(ticker, base, years, proj, sbc_rows, market_cap)
 
     labels = [f"{base['label']} Actual"] + [f"{y}E" for y in years]
     chart_labels = [f"{base['label']}<br>Actual"] + labels[1:]  # two-line label keeps ticks horizontal
@@ -1403,15 +1411,44 @@ def eps_caption(defaults: dict, years: list[int], eps: list, base: dict) -> str:
     return "".join(parts)
 
 
-def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt, shares, price,
+def dcf_share_count(history: pd.DataFrame, base: dict, m: dict, shares_outstanding) -> dict:
+    """Shares the DCF divides by: FY weighted-average DILUTED shares from SEC EDGAR, else the provider's
+    figure for the same fiscal year, else current shares outstanding (labelled as such). Reported figures
+    are used as-is — in loss years diluted equals basic, and no higher count is invented."""
+    fy = base["label"]
+    if not history.empty and pos(history.iloc[-1].get("Diluted shares")):
+        return {"count": float(history.iloc[-1]["Diluted shares"]), "diluted": True,
+                "source": f"{fy} weighted-average diluted shares, SEC EDGAR"}
+    for row in m.get("annual") or []:
+        try:
+            same_year = abs((pd.Timestamp(row["date"]) - base["end"]).days) <= 21
+        except (KeyError, ValueError):
+            continue
+        if same_year and pos(row.get("diluted_shares")):
+            return {"count": float(row["diluted_shares"]), "diluted": True,
+                    "source": f"{fy} weighted-average diluted shares, {row['source']}"}
+    return {"count": pos(shares_outstanding), "diluted": False, "source": "current shares outstanding"}
+
+
+def shares_used_text(info: dict) -> str:
+    if info["diluted"]:
+        return f"Shares used (diluted): {info['count'] / 1e6:,.1f}M"
+    return f"Shares used: {info['count'] / 1e6:,.1f}M (diluted unavailable — shares outstanding used)"
+
+
+def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt, share_info: dict, price,
                sbc: list | None = None) -> float | None:
-    """Render the DCF section. Returns the implied price."""
+    """Render the DCF section. Returns the implied price (equity value ÷ diluted shares)."""
     st.header("Discounted Cash Flow")
     c1, c2 = st.columns(2)
     terminal = c1.slider("Terminal growth (%)", 0.0, 5.0, step=0.25,
                          **bound(seed_input(ticker, "terminal", 2.5, 0.0, 5.0))) / 100
     wacc = c2.slider("WACC / discount rate (%)", 4.0, 20.0, step=0.25,
                      **bound(seed_input(ticker, "wacc", 9.0, 4.0, 20.0))) / 100
+    shares = share_info["count"]
+    if pos(shares):
+        st.markdown(f"**{shares_used_text(share_info)}**")
+        st.caption(share_info["source"].capitalize() if not share_info["diluted"] else share_info["source"])
 
     if not proj:
         st.warning("No projection model — DCF cannot be computed.")
@@ -1451,7 +1488,8 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
         cols[3].metric("Net debt", fmt_money(net_debt or 0.0))
         cols = st.columns(4)
         cols[0].metric("Equity value", fmt_money(r["equity"]))
-        cols[1].metric("Shares outstanding", f"{shares / 1e6:,.1f}M")
+        cols[1].metric("Shares used (diluted)" if share_info["diluted"] else "Shares used", f"{shares / 1e6:,.1f}M",
+                       help=share_info["source"])
         cols[2].metric("Implied price", fmt_price(implied),
                        delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
         cols[3].metric("Current price", fmt_price(price))
@@ -1462,7 +1500,7 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
             ("Enterprise value", fmt_money(r["ev"])),
             ("Equity value", fmt_money(r["equity"])),
             ("Net debt", fmt_money(net_debt or 0.0)),
-            ("Shares outstanding", f"{shares / 1e6:,.1f}M"),
+            ("Shares used (diluted)" if share_info["diluted"] else "Shares used", f"{shares / 1e6:,.1f}M"),
             (f"Implied price (current {fmt_price(price)})", fmt_price(implied), "wide emph", up),
         ]))
     tv_share = r["pv_tv"] / r["ev"] if r["ev"] > 0 else None
@@ -1639,7 +1677,12 @@ def render_how_it_works() -> None:
         st.latex(r"EPS_t = EPS_{t-1} \times \frac{EBITDA_t}{EBITDA_{t-1}} \quad \text{(later years)}")
         st.markdown(f"Consensus EPS comes from {provider}. EPS is shown as N/A when the prior year's EPS "
                     "or EBITDA is not positive, so a loss is never compounded.")
-        st.markdown("**DCF** (r = WACC, g_T = terminal growth)")
+        st.markdown("**DCF** (r = WACC, g_T = terminal growth). The implied price divides equity value by "
+                    "**diluted** shares — the latest fiscal year's weighted-average diluted count from SEC EDGAR "
+                    "(else the provider's figure for that year, else current shares outstanding, labelled) — so "
+                    "options, RSUs and convertibles that will become shares are counted in the per-share value. "
+                    "In loss years companies report diluted equal to basic, and that reported figure is used as-is. "
+                    "The snapshot market cap and the multiples price targets keep using shares outstanding.")
         st.latex(r"PV(FCF_t) = \frac{FCF_t}{(1+r)^t}")
         st.latex(r"TV = \frac{FCF_5 (1+g_T)}{r - g_T} \qquad PV(TV) = \frac{TV}{(1+r)^5}")
         st.latex(r"EV = \sum_{t=1}^{5} PV(FCF_t) + PV(TV)")
@@ -1667,7 +1710,8 @@ def render_how_it_works() -> None:
                  r"P/S = \frac{\text{Mkt Cap}}{\text{Revenue}} \quad P/B = \frac{Price}{\text{Book/Share}}")
         st.latex(r"EV = \text{Mkt Cap} + \text{Debt} - \text{Cash} \quad EV/Sales \quad EV/EBITDA \quad "
                  r"\text{FCF Yield} = \frac{FCF}{\text{Mkt Cap}}")
-        st.markdown("**Stock-based compensation.** SBC history comes from SEC EDGAR (ShareBasedCompensation), "
+        st.markdown("**Stock-based compensation** is modelled only for software companies under $20B market "
+                    "cap, where dilution is typically material. SBC history comes from SEC EDGAR (ShareBasedCompensation), "
                     "else the provider's cash-flow statement. Projected SBC = projected revenue × SBC % (Trend, Flat "
                     "or Dollar-growth defaults, all editable). FCF after SBC = FCF − SBC; the DCF (after SBC) "
                     "discounts it with the same WACC, terminal growth, net debt and share count, and the share "
@@ -1938,7 +1982,10 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     # ---- 3. Projection model (1 actual year + 5 projected years)
     years = [base["end"].year + i for i in range(1, YEARS + 1)]
     defaults = build_defaults(base, years, m.get("estimates"), yf_est)
-    model = render_model(ticker, base, defaults, years, sbc_history(history, m), m["market_cap"])
+    # SBC is modelled only where dilution is typically material: software companies under $20B.
+    # Otherwise its history is not built at all (sbc_rows = None) and saved SBC inputs are simply ignored.
+    sbc_rows = sbc_history(history, m) if sbc_gate(m) else None
+    model = render_model(ticker, base, defaults, years, sbc_rows, m["market_cap"])
     proj, eps, sbc = model if model else (None, None, None)
 
     # ---- 4. DCF
@@ -1948,7 +1995,7 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
         show_dcf = st.checkbox("Show DCF anyway (not recommended for banks/insurers)", value=False,
                                key=f"force_dcf_{ticker}")
     if show_dcf:
-        dcf_price = render_dcf(ticker, proj, years, net_debt, shares, price, sbc)
+        dcf_price = render_dcf(ticker, proj, years, net_debt, dcf_share_count(history, base, m, shares), price, sbc)
     else:
         st.header("Discounted Cash Flow")
         st.info("DCF hidden for this financial company — see the warning above.")
@@ -2225,6 +2272,14 @@ def global_writes(items: dict) -> dict:
 # Stock-based compensation (SBC): history, projection methods, backtest
 # --------------------------------------------------------------------------- #
 SBC_METHODS = ["Trend", "Flat", "Dollar growth"]
+SBC_MAX_MARKET_CAP = 20e9
+SBC_GATE_NOTE = "SBC view is shown only for software companies under $20B market cap, where dilution is typically material."
+
+
+def sbc_gate(m: dict) -> bool:
+    """SBC system only for software / SaaS companies (provider industry contains "Software") under $20B."""
+    cap = pos(m.get("market_cap"))
+    return cap is not None and cap < SBC_MAX_MARKET_CAP and "software" in (m.get("industry") or "").lower()
 SBC_RECENCY = {0: 3.0, 1: 2.0, 2: 1.5}  # weight by age (0 = latest year); older years 0.5
 
 
