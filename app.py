@@ -294,15 +294,62 @@ def total_debt_series(facts: dict) -> pd.Series:
     return pd.Series(out, dtype="float64").sort_index()
 
 
-def latest_shares(facts: dict) -> tuple[float | None, str | None]:
-    """Shares outstanding from the cover page (summed across share classes)."""
+def cover_shares(facts: dict) -> tuple[float | None, str | None]:
+    """Total shares outstanding from the latest cover page in Company Facts (summed across share classes)."""
     rows = [f for f in _units(facts, "EntityCommonStockSharesOutstanding", "shares", "dei") if num(f.get("val"))]
-    if rows:
-        last_end = max(f["end"] for f in rows)
-        on_date = [f for f in rows if f["end"] == last_end]
-        last_accn = max(on_date, key=lambda f: f.get("filed", ""))["accn"]
-        total = sum(num(f["val"]) for f in on_date if f["accn"] == last_accn)
-        return total, last_end
+    if not rows:
+        return None, None
+    last_end = max(f["end"] for f in rows)
+    on_date = [f for f in rows if f["end"] == last_end]
+    last_accn = max(on_date, key=lambda f: f.get("filed", ""))["accn"]
+    return sum(num(f["val"]) for f in on_date if f["accn"] == last_accn), last_end
+
+
+COVER_FACT_RE = re.compile(r"<ix:nonFraction\b([^>]*\bname=\"dei:EntityCommonStockSharesOutstanding\"[^>]*)>(.*?)</ix:nonFraction>",
+                           re.S | re.I)
+CONTEXT_RE = re.compile(r"<(?:\w+:)?context\b[^>]*\bid=\"([^\"]+)\"[^>]*>(.*?)</(?:\w+:)?context>", re.S | re.I)
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def filing_cover_shares(cik: int) -> tuple[float | None, str | None]:
+    """Cover-page shares outstanding read from the latest 10-K/10-Q's inline XBRL. Company Facts omits
+    class-dimensioned cover facts, so multi-class issuers (e.g. Class A + Class B) have none there.
+    Uses the undimensioned total when the cover tags one, else sums the per-class facts."""
+    sub = requests.get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json", headers=sec_headers(),
+                       timeout=HTTP_TIMEOUT).json()
+    rec = sub["filings"]["recent"]
+    i = next((k for k, f in enumerate(rec["form"]) if f in ("10-K", "10-Q")), None)
+    if i is None:
+        return None, None
+    accn, doc = rec["accessionNumber"][i], rec["primaryDocument"][i]
+    r = requests.get(f"https://www.sec.gov/Archives/edgar/data/{int(cik)}/{accn.replace('-', '')}/{doc}",
+                     headers=sec_headers(), timeout=HTTP_TIMEOUT)
+    r.raise_for_status()
+    dimensioned = {cid: bool(re.search(r"explicitMember|typedMember", body)) for cid, body in CONTEXT_RE.findall(r.text)}
+    total, classes = None, {}
+    for attrs, text in COVER_FACT_RE.findall(r.text):
+        ctx = re.search(r'contextRef="([^"]+)"', attrs)
+        digits = re.sub(r"<[^>]+>|[^\d.]", "", text)
+        if not ctx or not digits:
+            continue
+        scale = re.search(r'scale="(-?\d+)"', attrs)
+        value = float(digits) * 10 ** int(scale.group(1) if scale else 0)
+        if dimensioned.get(ctx.group(1), False):
+            classes[ctx.group(1)] = value
+        else:
+            total = value
+    values = sorted(classes.values())
+    # A combined member (e.g. "Class A and Class B") already totals the per-class facts: don't count it twice.
+    if len(values) >= 3 and abs(values[-1] - sum(values[:-1])) <= 0.005 * values[-1]:
+        values = values[-1:]
+    shares = total if total else (sum(values) or None)
+    return shares, rec.get("reportDate", [None] * (i + 1))[i] or rec["filingDate"][i]
+
+
+def latest_shares(facts: dict, cover: tuple[float | None, str | None]) -> tuple[float | None, str | None]:
+    """Shares outstanding: the cover-page total, else the balance-sheet count, else FY diluted shares."""
+    if cover[0]:
+        return cover
     s = instant_values(facts, ["CommonStockSharesOutstanding"], unit="shares")
     if not s.empty:
         return float(s.iloc[-1]), s.index[-1].date().isoformat()
@@ -313,8 +360,9 @@ def latest_shares(facts: dict) -> tuple[float | None, str | None]:
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
-def edgar_fundamentals(cik: int) -> dict:
-    """Fetch EDGAR company facts and reduce them to a small, cacheable dict."""
+def edgar_fundamentals(cik: int, financial: bool = False) -> dict:
+    """Fetch EDGAR company facts and reduce them to a small, cacheable dict. Financial companies use a
+    total-revenue concept (revenue net of interest expense, or interest + noninterest income) first."""
     url = f"https://data.sec.gov/api/xbrl/companyfacts/CIK{int(cik):010d}.json"
     r = requests.get(url, headers=sec_headers(), timeout=HTTP_TIMEOUT)
     if r.status_code == 404:
@@ -330,6 +378,12 @@ def edgar_fundamentals(cik: int) -> dict:
         "SalesRevenueGoodsNet",
         "RevenuesNetOfInterestExpense",
     ])
+    if financial:
+        # Fee revenue alone understates a lender's revenue; prefer total net revenue.
+        interest = annual_flow(facts, ["InterestAndDividendIncomeOperating"])
+        nonint = annual_flow(facts, ["NoninterestIncome"])
+        both = (interest + nonint).dropna()
+        revenue = annual_flow(facts, ["RevenuesNetOfInterestExpense"]).combine_first(both).combine_first(revenue)
     net_income = annual_flow(facts, ["NetIncomeLoss", "ProfitLoss", "NetIncomeLossAvailableToCommonStockholdersBasic"])
     ocf = annual_flow(facts, [
         "NetCashProvidedByUsedInOperatingActivities",
@@ -339,6 +393,9 @@ def edgar_fundamentals(cik: int) -> dict:
         "PaymentsToAcquirePropertyPlantAndEquipment",
         "PaymentsToAcquireProductiveAssets",
         "PaymentsForCapitalImprovements",
+        "PaymentsToAcquireOtherPropertyPlantAndEquipment",
+        "PaymentsToAcquireOilAndGasPropertyAndEquipment",
+        "PaymentsToAcquireOilAndGasProperty",
     ])
     op_income = annual_flow(facts, ["OperatingIncomeLoss"])
     sbc = annual_flow(facts, ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"])
@@ -414,7 +471,13 @@ def edgar_fundamentals(cik: int) -> dict:
         })
     history = pd.DataFrame(rows).set_index("Fiscal Year") if rows else pd.DataFrame()
 
-    shares, shares_date = latest_shares(facts)
+    cover = cover_shares(facts)
+    if not cover[0]:
+        try:
+            cover = filing_cover_shares(cik)
+        except Exception:
+            cover = (None, None)
+    shares, shares_date = latest_shares(facts, cover)
     return {
         "name": facts.get("entityName"),
         "history": history,
@@ -424,6 +487,8 @@ def edgar_fundamentals(cik: int) -> dict:
         "debt_date": debt.index[-1].date().isoformat() if not debt.empty else None,
         "shares": shares,
         "shares_date": shares_date,
+        "cover_shares": cover[0],
+        "cover_date": cover[1],
         "note": None if rows else "No US-GAAP annual data found (foreign/IFRS filers are not supported).",
     }
 
@@ -1287,6 +1352,10 @@ def is_financial(sector: str | None, industry: str | None) -> bool:
     return "financial" in s or any(k in i for k in ("bank", "insurance", "insurer", "reinsurance"))
 
 
+def is_reit(sector: str | None, industry: str | None) -> bool:
+    return (sector or "").lower() == "real estate" and "reit" in (industry or "").lower()
+
+
 def upside(target, price) -> float | None:
     if num(target) is None or not pos(price):
         return None
@@ -1321,6 +1390,11 @@ def resolve_ticker(query: str) -> str | None:
     labels = [f"{r.ticker} — {r.title}" for r in matches.itertuples()]
     choice = st.selectbox("Matching companies", labels)
     return choice.split(" — ")[0]
+
+
+# SEC's ticker list can point a ticker at a newly formed holding company before it has filed any annual
+# report; the operating history stays under the predecessor registrant's CIK.
+PREDECESSOR_CIK = {"XOM": 34088}  # ExxonMobil Holdings Corp (2115436) → Exxon Mobil Corporation
 
 
 def lookup_cik(ticker: str) -> int | None:
@@ -1366,8 +1440,15 @@ DEFAULT_MODES = ["Consensus", "Upper-range"]
 BUILD_MODES = ["Detailed", "Simple"]
 
 
+def mark_recompute() -> None:
+    """A Build / Defaults switch: during the rerun that follows, results from the previous combination are
+    hidden as soon as they are stale, so no screen ever mixes the old and the new valuation."""
+    st.session_state["_recompute"] = True
+
+
 def switch_defaults_mode(ticker: str, by_mode: dict) -> None:
     """Mode switch: re-default only boxes still at the previous mode's default; edited boxes are kept."""
+    mark_recompute()
     new = st.session_state[input_key(ticker, "dmode")]
     old = next(m for m in DEFAULT_MODES if m != new)
     for kind in ("growth", "margin"):
@@ -1377,28 +1458,12 @@ def switch_defaults_mode(ticker: str, by_mode: dict) -> None:
                 st.session_state[key] = by_mode[new][kind][i]
 
 
-def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_rows: list[dict] | None,
-                 market_cap, upper: dict | None = None, share_info: dict | None = None
-                 ) -> tuple[list[dict], list, list | None] | None:
-    """Assumption boxes, SBC projection, calculated table and bar chart.
-    Returns (projected years, projected EPS, projected SBC $ per year or None)."""
-    st.header("Financial Model")
-    if not pos(base["revenue"]):
-        st.warning("Base-year revenue is unavailable, so the projection model and DCF cannot be built.")
-        return None
-    if base["ebitda"] is None:
-        st.warning("Base-year Adjusted EBITDA is unavailable (no provider EBITDA, and operating income or D&A not "
-                   "reported on EDGAR). Adj. EBITDA margin defaults start at 0% — enter your own margins.")
-    elif base["ebitda"] <= 0:
-        st.warning("Base-year Adjusted EBITDA is negative. The Adjusted EBITDA → FCF bridge (FCF conversion %) is unreliable "
-                   "for this company; treat the projected FCF and DCF with caution.")
-    for note in base["notes"]:
-        st.caption(md_escape(note))
-
+def model_setup(ticker: str, base: dict, defaults: dict, upper: dict | None, silent: bool = False):
+    """Seed every assumption box (saved value first, else the active mode's default) before any widget is
+    created. Returns (components, defaults by mode, defaults-mode key, build key, detailed?)."""
     comp = base.get("components") or {"available": False}
     by_mode = {"Consensus": {"growth": defaults["growth"], "margin": defaults["margin"]},
                "Upper-range": upper or {"growth": defaults["growth"], "margin": defaults["margin"]}}
-    # Seed every box (saved value first, else the active mode's default) before any widget is created.
     dmode_key = seed_input(ticker, "dmode", "Consensus", options=DEFAULT_MODES)
     build_key = seed_input(ticker, "build", "Detailed" if comp["available"] else "Simple", options=BUILD_MODES)
     active = by_mode[st.session_state[dmode_key]]
@@ -1415,8 +1480,50 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
     detailed = st.session_state[build_key] == "Detailed" and comp["available"]
     # Streamlit drops the state of widgets that are not drawn, so carry the hidden build's boxes across reruns.
     hidden = ["conv"] if detailed else [f"{p}{i}" for p in "dcw" for i in range(YEARS)] + ["tax"] if comp["available"] else []
+    if silent:  # nothing is drawn (gated DCF), so every box is carried
+        hidden = list(st.session_state[f"_defaults_{ticker}"])
     for k in hidden:
-        st.session_state[input_key(ticker, k)] = st.session_state[input_key(ticker, k)]
+        key = input_key(ticker, k)
+        if key in st.session_state:
+            st.session_state[key] = st.session_state[key]
+    return comp, by_mode, dmode_key, build_key, detailed
+
+
+def model_projection(ticker: str, base: dict, defaults: dict, detailed: bool, share_info: dict | None):
+    """The projection for the current (ticker, build, defaults mode) inputs: (projected years, EPS)."""
+    growth = [st.session_state[input_key(ticker, f"g{i}")] for i in range(YEARS)]
+    margin = [st.session_state[input_key(ticker, f"m{i}")] for i in range(YEARS)]
+    if detailed:
+        read = lambda kind: [st.session_state[input_key(ticker, f"{kind}{i}")] for i in range(YEARS)]
+        proj = project_detailed(base["revenue"], growth, margin, read("d"), read("c"), read("w"),
+                                st.session_state[input_key(ticker, "tax")])
+        diluted = (share_info or {}).get("count")
+        eps = [p["nopat"] / diluted if pos(diluted) else None for p in proj]  # EPS = NOPAT ÷ diluted shares
+    else:
+        proj = project(base["revenue"], growth, margin, st.session_state[input_key(ticker, "conv")])
+        eps = project_eps(base["eps"], base["ebitda"], proj, defaults["eps"])
+    return proj, eps
+
+
+def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_rows: list[dict] | None,
+                 market_cap, upper: dict | None = None, share_info: dict | None = None, sbc_note: bool = False
+                 ) -> tuple[list[dict], list, list | None] | None:
+    """Assumption boxes, SBC projection, calculated table and bar chart.
+    Returns (projected years, projected EPS, projected SBC $ per year or None)."""
+    st.header("Financial Model")
+    if not pos(base["revenue"]):
+        st.warning("Base-year revenue is unavailable, so the projection model and DCF cannot be built.")
+        return None
+    if base["ebitda"] is None:
+        st.warning("Base-year Adjusted EBITDA is unavailable (no provider EBITDA, and operating income or D&A not "
+                   "reported on EDGAR). Adj. EBITDA margin defaults start at 0% — enter your own margins.")
+    elif base["ebitda"] <= 0:
+        st.warning("Base-year Adjusted EBITDA is negative. The Adjusted EBITDA → FCF bridge (FCF conversion %) is unreliable "
+                   "for this company; treat the projected FCF and DCF with caution.")
+    for note in base["notes"]:
+        st.caption(md_escape(note))
+
+    comp, by_mode, dmode_key, build_key, detailed = model_setup(ticker, base, defaults, upper)
 
     st.markdown(ASSUMPTION_CSS, unsafe_allow_html=True)
     with st.container(border=True, key="assumptions"):
@@ -1431,7 +1538,7 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
                                    help="Consensus: analyst averages. Upper-range: ≈75th percentile of analyst revenue "
                                         "estimates and the company's own margin-improvement trend.")
         modes[1].segmented_control("Build", BUILD_MODES, required=True, key=build_key,
-                                   default=st.session_state[build_key],
+                                   default=st.session_state[build_key], on_change=mark_recompute,
                                    help="Detailed: EBITDA → EBIT → NOPAT → unlevered FCF from D&A, capex, ΔNWC and tax. "
                                         "Simple: FCF = Adj. EBITDA × FCF conversion %.")
         if not comp["available"]:
@@ -1498,20 +1605,10 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
                         "with the defaults mode.")
         st.caption(md_escape(caption + save_note))
 
-    growth = [st.session_state[input_key(ticker, f"g{i}")] for i in range(YEARS)]
-    margin = [st.session_state[input_key(ticker, f"m{i}")] for i in range(YEARS)]
-    conversion = st.session_state[input_key(ticker, "conv")]
-    if detailed:
-        read = lambda kind: [st.session_state[input_key(ticker, f"{kind}{i}")] for i in range(YEARS)]
-        proj = project_detailed(base["revenue"], growth, margin, read("d"), read("c"), read("w"),
-                                st.session_state[input_key(ticker, "tax")])
-        diluted = (share_info or {}).get("count")
-        eps = [p["nopat"] / diluted if pos(diluted) else None for p in proj]  # EPS = NOPAT ÷ diluted shares
-    else:
-        proj = project(base["revenue"], growth, margin, conversion)
-        eps = project_eps(base["eps"], base["ebitda"], proj, defaults["eps"])
+    proj, eps = model_projection(ticker, base, defaults, detailed, share_info)
     if sbc_rows is None:  # gated: not a software company under $20B
-        st.caption(SBC_GATE_NOTE)
+        if sbc_note:
+            st.caption(SBC_GATE_NOTE)
         sbc = None
     else:
         sbc = render_sbc(ticker, base, years, proj, sbc_rows, market_cap)
@@ -1551,14 +1648,17 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
     st.dataframe(table, width="stretch", height=(len(table) + 1) * 35 + 3,  # every row visible, no inner scroll
                  column_config={"_index": st.column_config.Column(width=215)})  # longest row label fits
     if detailed:
-        st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. Revenue, D&A, capex "
-                   f"and the change in operating working capital are reported; EBIT, tax and NOPAT are derived with the "
-                   f"{comp['tax_rate']:.1f}% default tax rate. Actual Adjusted EBITDA: {base['ebitda_source']}. "
-                   f"Actual EPS: {base['eps_source']}.")
+        st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. Revenue, D&A and "
+                   f"capex are reported; EBIT, tax and NOPAT are derived with the {base['label']} effective tax rate "
+                   f"({comp['base_tax_rate']:.1f}%, or the default when pre-tax income is not positive); the change in NWC is the implied working-capital & other operating change (NOPAT + D&A − "
+                   f"operating cash flow), so Actual unlevered FCF = operating cash flow − capex, the same Actual FCF "
+                   f"as the Simple build. Actual Adjusted EBITDA: {base['ebitda_source']}. EPS: base-year EPS is "
+                   f"{base['eps_source']}; projected EPS is NOPAT ÷ diluted shares.")
     else:
         st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. "
                    f"Actual FCF = operating cash flow − capex. Actual Adjusted EBITDA: {base['ebitda_source']}. "
-                   f"Actual EPS: {base['eps_source']}.")
+                   f"EPS: base-year EPS is {base['eps_source']}; projected EPS follows the analyst consensus where "
+                   f"available, else grows with projected EBITDA (Simple build has no NOPAT line; see the chart note).")
     try:
         import plotly.graph_objects as go
 
@@ -1584,13 +1684,14 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
 
 
 def base_detailed_actuals(base: dict, comp: dict) -> dict:
-    """Base-year column for the detailed build: reported revenue, EBITDA, D&A, capex and ΔNWC; EBIT, tax and
-    NOPAT derived with the default tax rate; unlevered FCF from those."""
+    """Base-year column for the detailed build: reported revenue, EBITDA, D&A and capex; EBIT, tax and NOPAT
+    derived with the base year's effective tax rate; ΔNWC implied (NOPAT + D&A − operating cash flow), so the
+    unlevered FCF equals reported operating cash flow − capex."""
     out = {"revenue": base["revenue"], "ebitda": base["ebitda"], "da": comp["da"], "capex": comp["capex"],
            "dnwc": comp.get("dnwc")}
     if base["ebitda"] is not None:
         out["ebit"] = base["ebitda"] - comp["da"]
-        out["tax"] = out["ebit"] * comp["tax_rate"] / 100
+        out["tax"] = out["ebit"] * comp["base_tax_rate"] / 100
         out["nopat"] = out["ebit"] - out["tax"]
         out["fcf"] = out["nopat"] + comp["da"] - comp["capex"] - (comp.get("dnwc") or 0.0)
     else:
@@ -1649,22 +1750,36 @@ def eps_caption(defaults: dict, years: list[int], eps: list, base: dict) -> str:
     return "".join(parts)
 
 
-def dcf_share_count(history: pd.DataFrame, base: dict, m: dict, shares_outstanding) -> dict:
-    """Shares the DCF divides by: FY weighted-average DILUTED shares from SEC EDGAR, else the provider's
-    figure for the same fiscal year, else current shares outstanding (labelled as such). Reported figures
-    are used as-is — in loss years diluted equals basic, and no higher count is invented."""
+def dcf_share_count(history: pd.DataFrame, base: dict, m: dict, shares_outstanding, cover=None,
+                    cover_date=None) -> dict:
+    """The one diluted share count the Valuation view divides by (DCF and every price target).
+
+    The larger of (a) the FY weighted-average DILUTED shares (SEC EDGAR, else the provider's figure for
+    the same fiscal year) and (b) the latest cover-page shares outstanding summed across all classes
+    (SEC EDGAR) — so issuance since fiscal year-end is not missed, while buyback names keep the FY
+    count. Falls back to current shares outstanding (labelled as such)."""
     fy = base["label"]
+    fy_count = None
     if not history.empty and pos(history.iloc[-1].get("Diluted shares")):
-        return {"count": float(history.iloc[-1]["Diluted shares"]), "diluted": True,
-                "source": f"{fy} weighted-average diluted shares, SEC EDGAR"}
-    for row in m.get("annual") or []:
-        try:
-            same_year = abs((pd.Timestamp(row["date"]) - base["end"]).days) <= 21
-        except (KeyError, ValueError):
-            continue
-        if same_year and pos(row.get("diluted_shares")):
-            return {"count": float(row["diluted_shares"]), "diluted": True,
-                    "source": f"{fy} weighted-average diluted shares, {row['source']}"}
+        fy_count = {"count": float(history.iloc[-1]["Diluted shares"]), "diluted": True,
+                    "source": f"{fy} weighted-average diluted shares, SEC EDGAR"}
+    else:
+        for row in m.get("annual") or []:
+            try:
+                same_year = abs((pd.Timestamp(row["date"]) - base["end"]).days) <= 21
+            except (KeyError, ValueError):
+                continue
+            if same_year and pos(row.get("diluted_shares")):
+                fy_count = {"count": float(row["diluted_shares"]), "diluted": True,
+                            "source": f"{fy} weighted-average diluted shares, {row['source']}"}
+                break
+    if fy_count and pos(cover) and cover > fy_count["count"]:
+        return {"count": float(cover), "diluted": True,
+                "source": f"total shares outstanding across all classes, latest SEC EDGAR cover"
+                          f"{f' ({cover_date})' if cover_date else ''} — exceeds the {fy} weighted-average diluted "
+                          f"count of {fy_count['count'] / 1e6:,.1f}M"}
+    if fy_count:
+        return fy_count
     return {"count": pos(shares_outstanding), "diluted": False, "source": "current shares outstanding"}
 
 
@@ -1718,12 +1833,14 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
 
     implied = r["price"]
     up = upside(implied, price)
+    # Negative net debt is net cash, shown as a positive amount (as in the price-target bridge).
+    nd_label, nd_value = ("Net cash", -net_debt) if (net_debt or 0.0) < 0 else ("Net debt", net_debt or 0.0)
     with st.container(key="desk_dcf"):
         cols = st.columns(4)
         cols[0].metric("Sum of PV (FCF)", fmt_money(sum(r["pv_flows"])))
         cols[1].metric("Terminal value (PV)", fmt_money(r["pv_tv"]), help=f"Undiscounted: {fmt_money(r['tv'])}")
         cols[2].metric("Enterprise value", fmt_money(r["ev"]))
-        cols[3].metric("Net debt", fmt_money(net_debt or 0.0))
+        cols[3].metric(nd_label, fmt_money(nd_value))
         cols = st.columns(4)
         cols[0].metric("Equity value", fmt_money(r["equity"]))
         cols[1].metric("Shares used (diluted)" if share_info["diluted"] else "Shares used", f"{shares / 1e6:,.1f}M",
@@ -1737,7 +1854,7 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
             ("PV of terminal value", fmt_money(r["pv_tv"])),
             ("Enterprise value", fmt_money(r["ev"])),
             ("Equity value", fmt_money(r["equity"])),
-            ("Net debt", fmt_money(net_debt or 0.0)),
+            (nd_label, fmt_money(nd_value)),
             ("Shares used (diluted)" if share_info["diluted"] else "Shares used", f"{shares / 1e6:,.1f}M"),
             (f"Implied price (current {fmt_price(price)})", fmt_price(implied), "wide emph", up),
         ]))
@@ -1754,8 +1871,10 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
     return implied if implied > 0 else None
 
 
-def render_price_targets(ticker, m, shares, net_debt, ntm: dict | None, base_fcf, base_label) -> list[tuple]:
-    """Render the Price Target Setter on a 12-month-forward basis. Returns [(method, target price)]."""
+def render_price_targets(ticker, m, share_info: dict, net_debt, ntm: dict | None, base_fcf, base_label) -> list[tuple]:
+    """Render the Price Target Setter on a 12-month-forward basis, dividing by the same diluted share count
+    as the DCF. Returns [(method, target price)]."""
+    shares = share_info["count"]
     st.header("Price Target Setter")
     price = m["price"]
     results: list[tuple] = []
@@ -1774,7 +1893,8 @@ def render_price_targets(ticker, m, shares, net_debt, ntm: dict | None, base_fcf
     cols[3].metric("NTM EPS (diluted)", fmt_price(ntm["eps"]))
     st.caption("NTM = next twelve months from today, calendarized from your projections in the model above. "
                "Every method below applies a target multiple to these NTM figures, so each result is a "
-               "12-month price target. Target multiples default to the company's multiple today.")
+               "12-month price target. Target multiples default to the company's multiple today. Per-share "
+               f"targets divide by {shares / 1e6:,.1f}M shares ({share_info['source']}), the same count as the DCF.")
 
     def target_input(label: str, name: str, today_value, fallback: float, basis: str, step: float) -> float:
         today_value = pos(today_value)
@@ -1797,7 +1917,7 @@ def render_price_targets(ticker, m, shares, net_debt, ntm: dict | None, base_fcf
         else:
             st.warning(f"{label}: inputs produce a non-positive price, excluded from the summary.")
 
-    per_share = f"{shares / 1e6:,.1f}M shares"
+    per_share = f"{shares / 1e6:,.1f}M {'diluted ' if share_info['diluted'] else ''}shares"
     if pos(ntm["eps"]):
         st.subheader("P/E method")
         mult = target_input("Target P/E", "pe_mult", pos(m["pe_fwd"]) or pos(m["pe_ttm"]), 15.0,
@@ -1842,7 +1962,8 @@ def render_summary(dcf_price: float | None, multiples: list[tuple], price) -> No
                       delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
         else:
             st.metric("DCF implied price", "N/A")
-            st.caption("No DCF value: it is hidden for banks/insurers or not meaningful for this company's cash flows.")
+            st.caption("No DCF value: it is hidden for banks/insurers and REITs, or not meaningful for this company's "
+                       "cash flows.")
     with right.container(border=True, key="sum_ntm"):
         if len(multiples) >= 2:
             names = ", ".join(n for n, _ in multiples)
@@ -1904,11 +2025,14 @@ def render_how_it_works() -> None:
         st.latex(r"EBIT_t = \text{Adj. EBITDA}_t - D\&A_t \qquad NOPAT_t = EBIT_t \times (1 - \tau)")
         st.latex(r"\text{Unlevered FCF}_t = NOPAT_t + D\&A_t - Capex_t - \Delta NWC_t")
         st.markdown("D&A, capex and ΔNWC are revenue × their %; tax is applied once to EBIT with no floor (a negative "
-                    "EBIT gives a tax benefit). Defaults come from the latest fiscal year on SEC EDGAR: D&A ÷ revenue, "
-                    "capex ÷ revenue, the change in operating working capital ((current assets − cash) − (current "
-                    "liabilities − current debt)) ÷ revenue averaged over up to the three latest fiscal years, positive "
-                    "meaning cash outflow (0.0 if the tags are missing), "
-                    "and tax expense ÷ pre-tax income clamped to 0–40% (21% if pre-tax income is not positive). Projected "
+                    "EBIT gives a tax benefit). Defaults (SEC EDGAR): D&A ÷ revenue and capex ÷ revenue from the latest "
+                    "fiscal year; ΔNWC = the implied working-capital & other operating change, NOPAT + D&A − operating "
+                    "cash flow, ÷ revenue, averaged over up to the three latest fiscal years, positive meaning cash "
+                    "outflow (a year missing a component uses the balance-sheet change in operating working capital; "
+                    "0.0 if neither is available) — so the Actual column's unlevered FCF equals reported operating cash "
+                    "flow − capex; tax = the average effective rate (tax ÷ pre-tax income, each year clamped to 0–40%) "
+                    "over up to three recent years with positive pre-tax income, or 21% if there is none or the average "
+                    "is 0% despite positive pre-tax income. Projected "
                     "EPS = NOPAT ÷ diluted shares. If EDGAR lacks D&A or capex, the **Simple** build is used instead, "
                     "and it can be chosen manually:")
         st.latex(r"FCF_t = \text{Adj. EBITDA}_t \times c \quad \text{(Simple build)}")
@@ -1932,13 +2056,15 @@ def render_how_it_works() -> None:
         st.markdown(f"Consensus EPS comes from {provider}. EPS is shown as N/A when the prior year's EPS "
                     "or EBITDA is not positive, so a loss is never compounded.")
         st.markdown("**DCF** (r = WACC, g_T = terminal growth). The implied price divides equity value by "
-                    "**diluted** shares — the latest fiscal year's weighted-average diluted count from SEC EDGAR "
-                    "(else the provider's figure for that year, else current shares outstanding, labelled) — so "
-                    "options, RSUs and convertibles that will become shares are counted in the per-share value. "
-                    "In loss years companies report diluted equal to basic, and that reported figure is used as-is. "
+                    "**diluted** shares — the larger of the latest fiscal year's weighted-average diluted count (SEC "
+                    "EDGAR, else the provider's figure for that year) and the latest cover-page shares outstanding "
+                    "summed across all share classes (SEC EDGAR), so shares issued since year-end are not missed; "
+                    "else current shares outstanding, labelled. Options, RSUs and convertibles that will become shares "
+                    "are counted in the per-share value. The 12-month price targets divide by the same count. "
                     "The DCF (after SBC) block instead divides by shares outstanding: its cash flows already deduct "
                     "projected SBC, so also counting the awards in a diluted share count would charge for them twice. "
-                    "The snapshot market cap and the multiples price targets keep using shares outstanding.")
+                    "The snapshot market cap keeps using shares outstanding. Banks, insurers and REITs get a warning "
+                    "and the model and DCF stay hidden unless you opt in.")
         st.latex(r"PV(FCF_t) = \frac{FCF_t}{(1+r)^t}")
         st.latex(r"TV = \frac{FCF_5 (1+g_T)}{r - g_T} \qquad PV(TV) = \frac{TV}{(1+r)^5}")
         st.latex(r"EV = \sum_{t=1}^{5} PV(FCF_t) + PV(TV)")
@@ -1986,42 +2112,112 @@ def render_footer() -> None:
     st.caption(f"**{FOOTER}**")
 
 
-def detailed_components(history: pd.DataFrame, base: dict) -> dict:
-    """Default D&A %, capex % and tax rate for the detailed build from the latest EDGAR fiscal year; ΔNWC % from up to three."""
+def provider_year(m: dict, end) -> dict | None:
+    """The provider's annual row for the fiscal year ending on `end` (period end within ~3 weeks)."""
+    for row in m.get("annual") or []:
+        try:
+            if abs((pd.Timestamp(row["date"]) - pd.Timestamp(end)).days) <= 21:
+                return row
+        except (KeyError, ValueError):
+            continue
+    return None
+
+
+def year_adj_ebitda(row: pd.Series, m: dict) -> float | None:
+    """A historical year's Adjusted EBITDA built the same way as the base year's: provider normalized (or
+    reported) EBITDA, else SEC EDGAR operating income + D&A, plus stock-based compensation."""
+    provider = provider_year(m, row["Period End"])
+    core = None
+    if provider and provider.get("ebitda_norm") is not None:
+        core = provider["ebitda_norm"]
+    elif provider and provider.get("ebitda") is not None:
+        core = provider["ebitda"]
+    else:
+        core = num(row.get("EBITDA"))
+    sbc = num(row.get("Stock-Based Compensation"))
+    if sbc is None and provider:
+        sbc = provider.get("sbc")
+    return core + (sbc or 0.0) if core is not None else None
+
+
+def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None) -> dict:
+    """Defaults for the detailed build. D&A % and capex %: latest EDGAR fiscal year. Tax rate: average
+    effective rate over up to three fiscal years with positive pre-tax income. ΔNWC %: average over up to
+    three fiscal years of the implied working-capital & other operating change, NOPAT + D&A − operating
+    cash flow (balance-sheet working capital for a year missing a component)."""
     comp = {"available": False}
     if history.empty or not pos(base.get("revenue")):
         return comp
+    m = m or {}
     row = history.iloc[-1]
-    prev = history.iloc[-2] if len(history) > 1 else None
     rev, da, capex, fy = base["revenue"], num(row.get("D&A")), num(row.get("Capex")), base["label"]
     if da is None or capex is None:
         return comp
     comp.update(available=True, da=da, capex=capex, da_pct=da / rev * 100, capex_pct=capex / rev * 100)
-    nwc_now, nwc_prev = num(row.get("Operating NWC")), num(prev.get("Operating NWC")) if prev is not None else None
-    comp["dnwc"] = nwc_now - nwc_prev if nwc_now is not None and nwc_prev is not None else None  # base-year actual
-    # Default: average ΔNWC % of revenue over up to the three latest fiscal years (base year and the two before it).
-    per_year = []
-    for k in range(len(history) - 1, max(len(history) - 4, 0), -1):
-        cur, before = history.iloc[k], history.iloc[k - 1]
-        now, then = num(cur.get("Operating NWC")), num(before.get("Operating NWC"))
-        year_rev = rev if k == len(history) - 1 else num(cur.get("Revenue"))
-        if now is not None and then is not None and pos(year_rev):
-            per_year.append((history.index[k], (now - then) / year_rev * 100))
+    recent = range(len(history) - 1, max(len(history) - 4, -1), -1)  # base year and up to two before it
+
+    # Tax: per-year effective rate (clamped 0–40%), only years with positive pre-tax income.
+    rates = []
+    for k in recent:
+        tax, pre = num(history.iloc[k].get("Income tax")), num(history.iloc[k].get("Pretax income"))
+        if tax is not None and pos(pre):
+            rates.append((history.index[k], min(max(tax / pre * 100, 0.0), 40.0)))
+    avg_rate = sum(r for _, r in rates) / len(rates) if rates else None
+    base_pre_positive = pos(row.get("Pretax income")) is not None
+    if avg_rate is None or (avg_rate == 0.0 and base_pre_positive):
+        why = ("no recent year has positive pre-tax income and reported tax" if avg_rate is None
+               else "the effective rates average 0% (tax benefits) despite positive pre-tax income")
+        comp.update(tax_rate=21.0, tax_years=rates, tax_note=f"21% default — {why}")
+    else:
+        used = ", ".join(f"{label} {r:.1f}%" for label, r in reversed(rates))
+        comp.update(tax_rate=avg_rate, tax_years=rates,
+                    tax_note=f"{len(rates)}-year average effective rate ({used}), SEC EDGAR, each year clamped to 0–40%")
+    def year_rate(k: int) -> float:
+        """That year's effective tax rate (clamped 0–40%); the default rate if pre-tax income is not positive."""
+        tax, pre = num(history.iloc[k].get("Income tax")), num(history.iloc[k].get("Pretax income"))
+        return min(max(tax / pre * 100, 0.0), 40.0) if tax is not None and pos(pre) else comp["tax_rate"]
+
+    comp["base_tax_rate"] = year_rate(len(history) - 1)  # used for the Actual column's tax and NOPAT
+
+    # ΔNWC: implied from cash flow (NOPAT + D&A − operating cash flow), positive = cash outflow.
+    def implied(k: int) -> float | None:
+        cur = history.iloc[k]
+        ebitda = base["ebitda"] if k == len(history) - 1 else year_adj_ebitda(cur, m)
+        d, ocf = num(cur.get("D&A")), num(cur.get("Operating Cash Flow"))
+        if ebitda is None or d is None or ocf is None:
+            return None
+        return (ebitda - d) * (1 - year_rate(k) / 100) + d - ocf  # NOPAT + D&A − OCF
+
+    def balance_sheet(k: int) -> float | None:
+        if k == 0:
+            return None
+        now, then = num(history.iloc[k].get("Operating NWC")), num(history.iloc[k - 1].get("Operating NWC"))
+        return now - then if now is not None and then is not None else None
+
+    per_year, fallback_years = [], []
+    for k in recent:
+        year_rev = rev if k == len(history) - 1 else num(history.iloc[k].get("Revenue"))
+        value = implied(k)
+        if value is None:
+            value = balance_sheet(k)
+            if value is not None:
+                fallback_years.append(history.index[k])
+        if value is not None and pos(year_rev):
+            per_year.append((history.index[k], value / year_rev * 100))
+            if k == len(history) - 1:
+                comp["dnwc"] = value  # base-year Actual column (implied, so Actual FCF = OCF − capex)
+    comp.setdefault("dnwc", None)
     if per_year:
         used = ", ".join(f"{label} {v:.2f}%" for label, v in reversed(per_year))
-        comp.update(nwc_pct=sum(v for _, v in per_year) / len(per_year), nwc_years=per_year,
-                    nwc_note=f"{len(per_year)}-year average of the change in operating working capital ÷ revenue "
-                             f"({used}), SEC EDGAR; positive = cash outflow")
+        note = (f"{len(per_year)}-year average of the implied working-capital & other operating change (NOPAT + D&A − "
+                f"operating cash flow) ÷ revenue ({used}), SEC EDGAR; positive = cash outflow")
+        if fallback_years:
+            note += (f"; {', '.join(reversed(fallback_years))}: operating cash flow or a component unavailable, so "
+                     "the balance-sheet change in operating working capital is used")
+        comp.update(nwc_pct=sum(v for _, v in per_year) / len(per_year), nwc_years=per_year, nwc_note=note)
     else:
         comp.update(nwc_pct=0.0, nwc_years=[],
                     nwc_note="defaulted to 0.0 — working-capital tags were not available on SEC EDGAR")
-    tax, pre = num(row.get("Income tax")), num(row.get("Pretax income"))
-    if tax is not None and pos(pre):
-        comp.update(tax_rate=min(max(tax / pre * 100, 0.0), 40.0),
-                    tax_note=f"{fy} effective rate, SEC EDGAR, clamped to 0–40%"
-                             + ("; pre-tax income = net income + tax" if bool(row.get("Pretax derived")) else ""))
-    else:
-        comp.update(tax_rate=21.0, tax_note="21% default — pre-tax income not positive or tax tags missing")
     return comp
 
 
@@ -2096,8 +2292,18 @@ def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
     else:
         base["ebitda"], base["ebitda_source"] = None, "not available"
 
-    # Default FCF conversion: the company's actual TTM ratio, same provider and period, uncapped.
-    if ttm and ttm["adj_ebitda"]:
+    # Default FCF conversion: the company's actual TTM ratio, same provider and period, uncapped. A ratio on
+    # non-positive Adjusted EBITDA (e.g. two negatives dividing to +260%) is not meaningful.
+    ebitda_for_ratio = ttm["adj_ebitda"] if ttm and ttm["adj_ebitda"] else base["ebitda"]
+    if ebitda_for_ratio is not None and ebitda_for_ratio <= 0:
+        ratio = 0.0
+        which = f"TTM ({ttm['source']})" if ttm and ttm["adj_ebitda"] else fy
+        base["conv_calc"] = (f"FCF conversion: Not meaningful — {which} Adjusted EBITDA is "
+                             f"{fmt_money(ebitda_for_ratio)}, so FCF ÷ Adj. EBITDA has no economic meaning. "
+                             "Enter your own long-run conversion.")
+        base["conv_note"] = "not meaningful (Adjusted EBITDA ≤ 0) — enter your own"
+        base["conv_nm"] = True
+    elif ttm and ttm["adj_ebitda"]:
         ratio = ttm["fcf"] / ttm["adj_ebitda"] * 100
         base["conv_calc"] = (f"TTM FCF {fmt_money(ttm['fcf'])} ÷ TTM Adj. EBITDA {fmt_money(ttm['adj_ebitda'])} "
                              f"= {ratio:.1f}% ({ttm['source']}, {ttm['period']}; Adj. EBITDA = "
@@ -2113,9 +2319,9 @@ def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
         base["conv_calc"] = "Not computable: no TTM or base-year Adjusted EBITDA. Enter your own conversion."
         base["conv_note"] = "not computable — enter your own"
     base["conversion"] = round(ratio, 1)
-    base["conv_unusual"] = ratio > 100 or ratio < 0
+    base["conv_unusual"] = (ratio > 100 or ratio < 0) and not base.get("conv_nm")
 
-    base["components"] = detailed_components(history, base)
+    base["components"] = detailed_components(history, base, m)
 
     if base["eps"] is None and provider and provider["eps_diluted"] is not None:
         base["eps"], base["eps_source"] = provider["eps_diluted"], f"reported diluted EPS ({provider['source']})"
@@ -2129,6 +2335,11 @@ def main() -> str | None:
     """Route to the active view. Returns the ticker whose inputs should be saved, if any."""
     view = st.session_state.get("view", "valuation")
     st.html(app_css())  # texture, tab bar, compact grids; style-only HTML takes no layout space
+    if st.session_state.pop("_recompute", False):
+        # After a Build / Defaults switch, Streamlit redraws the page top to bottom, so for a moment the
+        # model or DCF could show the new valuation while the Summary below still shows the old one.
+        # Elements not yet redrawn in this run are hidden (keeping their space) until they catch up.
+        st.html('<style>[data-testid="stElementContainer"][data-stale="true"] { visibility: hidden; }</style>')
     render_header(VIEW_TITLES[view])
     render_topnav(view)
 
@@ -2173,13 +2384,15 @@ def valuation_view(items: dict | None) -> str | None:
     if slot is not None:
         slot.html(loading_html(ticker))
     m, source, warnings = get_market_data(ticker)
-    cik = lookup_cik(ticker)
+    financial = is_financial(m["sector"], m["industry"])
     edgar: dict = {"history": pd.DataFrame(), "note": "Ticker not found in the SEC company list."}
-    if cik is not None:
+    for cik in dict.fromkeys(c for c in (lookup_cik(ticker), PREDECESSOR_CIK.get(ticker)) if c is not None):
         try:
-            edgar = edgar_fundamentals(cik)
+            edgar = edgar_fundamentals(cik, financial)
         except Exception as exc:
             edgar = {"history": pd.DataFrame(), "note": f"SEC EDGAR request failed ({type(exc).__name__})."}
+        if not edgar["history"].empty:
+            break
     yf_est = None
     fmp_est = m.get("estimates") or []
     if (m["price"] or not edgar["history"].empty) and not any(e.get("eps") is not None for e in fmp_est):
@@ -2260,8 +2473,9 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
         caption += f" ⚠️ Quote currency is {m['currency']}; EDGAR figures are USD."
     st.caption(caption)
 
-    # ---- 7. Financials warning
+    # ---- 7. Financials / REIT warning: the firm-level DCF and its model are gated behind an opt-in
     financial = is_financial(m["sector"], m["industry"])
+    reit = not financial and is_reit(m["sector"], m["industry"])
     if financial:
         st.error(
             "### ⚠️ Firm-level DCF does not apply to banks and insurers\n"
@@ -2271,37 +2485,48 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
             "residual income, or justified P/B. The multiples sections below still apply. "
             "(For non-bank financials such as payment networks, a DCF may still be reasonable.)"
         )
+    elif reit:
+        st.error(
+            "### ⚠️ Firm-level DCF is a poor fit for REITs\n"
+            "Firm-level DCF is a poor fit for REITs: value is driven by FFO/AFFO and asset values, and the D&A "
+            "add-back overstates cash flow because property acquisitions sit outside capex. "
+            "The multiples sections below still apply."
+        )
 
     # ---- 2. Snapshot
     fcf_for_yield = num(m["fcf_ttm"]) if m["fcf_ttm"] is not None else base["fcf"]
     render_snapshot(m, fcf_for_yield, price)
 
-    # ---- 3. Projection model (1 actual year + 5 projected years)
+    # ---- 3. Projection model (1 actual year + 5 projected years) and 4. DCF
     years = [base["end"].year + i for i in range(1, YEARS + 1)]
     defaults = build_defaults(base, years, m.get("estimates"), yf_est)
     # SBC is modelled only where dilution is typically material: software companies under $20B.
     # Otherwise its history is not built at all (sbc_rows = None) and saved SBC inputs are simply ignored.
     sbc_rows = sbc_history(history, m) if sbc_gate(m) else None
-    share_info = dcf_share_count(history, base, m, shares)
+    share_info = dcf_share_count(history, base, m, shares, edgar.get("cover_shares"), edgar.get("cover_date"))
     upper = upper_range_defaults(base, years, defaults, margin_trend(history, m) if not history.empty else None)
-    model = render_model(ticker, base, defaults, years, sbc_rows, m["market_cap"], upper=upper, share_info=share_info)
-    proj, eps, sbc = model if model else (None, None, None)
-
-    # ---- 4. DCF
-    dcf_price = None
     show_dcf = True
-    if financial:
-        show_dcf = st.checkbox("Show DCF anyway (not recommended for banks/insurers)", value=False,
-                               key=f"force_dcf_{ticker}")
+    if financial or reit:
+        st.header("Financial Model & DCF")
+        show_dcf = st.checkbox("Show DCF anyway (not recommended for banks/insurers)" if financial
+                               else "Show DCF anyway", value=False, key=f"force_dcf_{ticker}")
+    dcf_price = None
     if show_dcf:
+        model = render_model(ticker, base, defaults, years, sbc_rows, m["market_cap"], upper=upper,
+                             share_info=share_info, sbc_note=sbc_note_applies(m))
+        proj, eps, sbc = model if model else (None, None, None)
         dcf_price = render_dcf(ticker, proj, years, net_debt, share_info, price, sbc, shares_outstanding=shares)
     else:
-        st.header("Discounted Cash Flow")
-        st.info("DCF hidden for this financial company — see the warning above.")
+        st.info(f"The projection model and DCF are hidden for this {'financial company' if financial else 'REIT'} — "
+                "see the warning above. The 12-month price targets below still use the default projection.")
+        proj = eps = None
+        if pos(base["revenue"]):  # the price targets still need NTM figures; computed without drawing the model
+            comp, _, _, _, detailed = model_setup(ticker, base, defaults, upper, silent=True)
+            proj, eps = model_projection(ticker, base, defaults, detailed, share_info)
 
     # ---- 5. Price targets (12-month forward)
     ntm = ntm_figures(base["end"], years, proj, eps) if proj else None
-    multiples = render_price_targets(ticker, m, shares, net_debt, ntm, base["fcf"], base["label"])
+    multiples = render_price_targets(ticker, m, share_info, net_debt, ntm, base["fcf"], base["label"])
 
     # ---- 6. Summary
     render_summary(dcf_price, multiples, price)
@@ -2567,13 +2792,20 @@ def global_writes(items: dict) -> dict:
 # --------------------------------------------------------------------------- #
 SBC_METHODS = ["Trend", "Flat", "Dollar growth"]
 SBC_MAX_MARKET_CAP = 20e9
-SBC_GATE_NOTE = "SBC view is shown only for software companies under $20B market cap, where dilution is typically material."
+SBC_GATE_NOTE = "SBC detail is shown for highly dilutive software companies under $20B market cap."
 
 
 def sbc_gate(m: dict) -> bool:
     """SBC system only for software / SaaS companies (provider industry contains "Software") under $20B."""
     cap = pos(m.get("market_cap"))
     return cap is not None and cap < SBC_MAX_MARKET_CAP and "software" in (m.get("industry") or "").lower()
+
+
+def sbc_note_applies(m: dict) -> bool:
+    """The gate note is shown only to names that meet one of the two tests (software, or under $20B)."""
+    cap = pos(m.get("market_cap"))
+    return "software" in (m.get("industry") or "").lower() or (cap is not None and cap < SBC_MAX_MARKET_CAP)
+
 SBC_RECENCY = {0: 3.0, 1: 2.0, 2: 1.5}  # weight by age (0 = latest year); older years 0.5
 
 
