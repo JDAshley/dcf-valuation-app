@@ -1472,7 +1472,7 @@ def model_setup(ticker: str, base: dict, defaults: dict, upper: dict | None, sil
         seed_input(ticker, f"m{i}", active["margin"][i])
         if comp["available"]:
             seed_input(ticker, f"d{i}", round(comp["da_pct"], 2))
-            seed_input(ticker, f"c{i}", round(comp["capex_pct"], 2))
+            seed_input(ticker, f"c{i}", round(comp["capex_path"][i], 2))
             seed_input(ticker, f"w{i}", round(comp["nwc_pct"], 2))
     if comp["available"]:
         seed_input(ticker, "tax", round(comp["tax_rate"], 1))
@@ -1599,9 +1599,9 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
         if st.session_state[dmode_key] == "Upper-range" and upper:
             caption = upper["note"] + " Consensus reference: " + caption.replace("**", "").replace("Defaults: ", "", 1)
         if detailed:
-            caption += (f" Detailed build defaults (flat across years): D&A {comp['da_pct']:.2f}% and capex "
-                        f"{comp['capex_pct']:.2f}% of revenue ({base['label']}, SEC EDGAR); ΔNWC {comp['nwc_pct']:.2f}% "
-                        f"({comp['nwc_note']}); tax {comp['tax_rate']:.1f}% ({comp['tax_note']}). These do not change "
+            caption += (f" Detailed build defaults: D&A {comp['da_pct']:.2f}% of revenue ({base['label']}, SEC EDGAR, "
+                        f"flat); {comp['capex_note']}; ΔNWC {comp['nwc_pct']:.2f}% (flat; "
+                        f"{comp['nwc_note']}); tax {comp['tax_rate']:.1f}% ({comp['tax_note']}). These do not change "
                         "with the defaults mode.")
         st.caption(md_escape(caption + save_note))
 
@@ -2026,7 +2026,8 @@ def render_how_it_works() -> None:
         st.latex(r"\text{Unlevered FCF}_t = NOPAT_t + D\&A_t - Capex_t - \Delta NWC_t")
         st.markdown("D&A, capex and ΔNWC are revenue × their %; tax is applied once to EBIT with no floor (a negative "
                     "EBIT gives a tax benefit). Defaults (SEC EDGAR): D&A ÷ revenue and capex ÷ revenue from the latest "
-                    "fiscal year; ΔNWC = the implied working-capital & other operating change, NOPAT + D&A − operating "
+                    "fiscal year, except that a base-year capex rate above its 3-year average glides linearly down to "
+                    "that average by Year 5 (it is never glided up); ΔNWC = the implied working-capital & other operating change, NOPAT + D&A − operating "
                     "cash flow, ÷ revenue, averaged over up to the three latest fiscal years, positive meaning cash "
                     "outflow (a year missing a component uses the balance-sheet change in operating working capital; "
                     "0.0 if neither is available) — so the Actual column's unlevered FCF equals reported operating cash "
@@ -2155,6 +2156,29 @@ def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None
         return comp
     comp.update(available=True, da=da, capex=capex, da_pct=da / rev * 100, capex_pct=capex / rev * 100)
     recent = range(len(history) - 1, max(len(history) - 4, -1), -1)  # base year and up to two before it
+
+    # Capex: a base year above the 3-year average (e.g. a buildout peak) glides down to that average by
+    # Year 5 in equal steps; otherwise the base-year rate is held flat (never glided up).
+    capex_years = []
+    for k in recent:
+        year_rev = rev if k == len(history) - 1 else num(history.iloc[k].get("Revenue"))
+        year_capex = num(history.iloc[k].get("Capex"))
+        if year_capex is not None and pos(year_rev):
+            capex_years.append((history.index[k], year_capex / year_rev * 100))
+    base_pct = comp["capex_pct"]
+    flat_note = f"capex {base_pct:.2f}% of revenue ({fy}, SEC EDGAR)"
+    comp.update(capex_path=[base_pct] * YEARS, capex_note=flat_note)
+    if len(capex_years) >= 2:
+        avg = sum(v for _, v in capex_years) / len(capex_years)
+        used = ", ".join(f"{label} {v:.2f}%" for label, v in reversed(capex_years))
+        if base_pct > avg:
+            step = (avg - base_pct) / (YEARS - 1)
+            comp.update(capex_path=[base_pct + step * i for i in range(YEARS)], capex_note=(
+                f"capex {base_pct:.2f}% of revenue in {fy} vs a {len(capex_years)}-year average of {avg:.2f}% "
+                f"({used}), SEC EDGAR — defaults glide from the base-year rate to the {len(capex_years)}-year average"))
+        else:
+            comp["capex_note"] = (f"capex {base_pct:.2f}% of revenue ({fy}, SEC EDGAR; at or below its "
+                                  f"{len(capex_years)}-year average of {avg:.2f}% — {used} — so held flat)")
 
     # Tax: per-year effective rate (clamped 0–40%), only years with positive pre-tax income.
     rates = []
