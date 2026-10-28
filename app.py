@@ -79,6 +79,15 @@ HEADER_CSS = """
 """
 
 
+def loading_html(ticker: str) -> str:
+    return ('<style>.jd-loading{display:flex;align-items:center;gap:.65rem;padding:1.25rem 0;font-size:1rem}'
+            '.jd-loading .spin{width:20px;height:20px;box-sizing:border-box;border-radius:50%;'
+            'border:3px solid rgba(128,128,128,.3);border-top-color:#3b82f6;animation:jdspin .8s linear infinite}'
+            '@keyframes jdspin{to{transform:rotate(360deg)}}</style>'
+            f'<div class="jd-loading" role="status"><span class="spin"></span>'
+            f'<span>Loading {html.escape(ticker)}…</span></div>')
+
+
 def render_header() -> None:
     """Compact page header: gold brand line and title on the left, JD logo on the right."""
     logo = _logo_data_uri()
@@ -961,6 +970,22 @@ def seed_input(ticker: str, name: str, default, lo=None, hi=None, options=None) 
     return key
 
 
+def bound(key: str) -> dict:
+    """Widget kwargs: the key plus an explicit value equal to its session state.
+
+    A widget created without ``value=`` declares its built-in default (a slider's minimum, 0.0
+    for a number box, "" for a text box). The app computes with the session-state value, but a
+    freshly mounted widget displays that declared default, so the screen could show 4.00% WACC
+    while the DCF used 9.00%. Declaring the real value keeps the two identical. Keyed sliders,
+    number and text inputs exclude ``value`` from their identity, so this never resets them."""
+    return {"key": key, "value": st.session_state[key]}
+
+
+# Inputs that are saved per ticker; older saved names (e.g. a removed method radio) are dropped.
+SAVED_INPUTS = {*(f"g{i}" for i in range(5)), *(f"m{i}" for i in range(5)), "conv", "wacc", "terminal",
+                "pe_mult", "ps_mult", "ev_mult", "pfcf_mult"}
+
+
 def reset_inputs(ticker: str) -> None:
     """Restore every input for this ticker to its default and drop the saved copy."""
     for name, default in st.session_state.get(f"_defaults_{ticker}", {}).items():
@@ -993,7 +1018,8 @@ def persist_inputs(ticker: str | None, slot) -> None:
             saved = saved_inputs(ticker)
             reset = st.session_state.pop(f"_reset_{ticker}", False)
             # Keep saved values for inputs not on screen this run (e.g. the P/S multiple while on P/E).
-            values = current if reset or not saved else {**saved["values"], **current}
+            kept = {n: v for n, v in (saved or {}).get("values", {}).items() if n in SAVED_INPUTS}
+            values = current if reset or not saved else {**kept, **current}
             item = f"dcf_inputs_{ticker}"
             if all(n in defaults and _same(v, defaults[n]) for n, v in values.items()):
                 if item in items:
@@ -1210,8 +1236,8 @@ def render_snapshot(m: dict, fcf_for_yield: float | None, price) -> None:
     st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable.")
 
 
-def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> list[dict] | None:
-    """Assumption boxes, calculated table and bar chart. Returns the projected years."""
+def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> tuple[list[dict], list] | None:
+    """Assumption boxes, calculated table and bar chart. Returns (projected years, projected EPS)."""
     st.header("Financial Model")
     if not pos(base["revenue"]):
         st.warning("Base-year revenue is unavailable, so the projection model and DCF cannot be built.")
@@ -1246,11 +1272,11 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> l
             cols = st.columns(widths, vertical_alignment="bottom")
             cols[0].markdown(f"**{label}**", help=help_text)
             for i, col in enumerate(cols[1:]):
-                col.number_input(f"{years[i]}E", key=input_key(ticker, f"{kind}{i}"), step=0.5, format="%.1f")
+                col.number_input(f"{years[i]}E", step=0.5, format="%.1f", **bound(input_key(ticker, f"{kind}{i}")))
         cols = st.columns([1.6, 1, 4], vertical_alignment="bottom")
         cols[0].markdown("**FCF conversion %**",
                          help="FCF ÷ Adjusted EBITDA. Projected FCF = projected Adjusted EBITDA × conversion %.")
-        cols[1].number_input("All years", key=input_key(ticker, "conv"), step=1.0, format="%.1f")
+        cols[1].number_input("All years", step=1.0, format="%.1f", **bound(input_key(ticker, "conv")))
         cols[2].caption(md_escape(base["conv_calc"]))
         conv_now = st.session_state[input_key(ticker, "conv")]
         if base["conv_unusual"]:
@@ -1306,8 +1332,40 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> l
     except ImportError:
         st.warning("Install plotly (`pip install plotly`) to see the chart.")
     st.caption(eps_caption(defaults, years, eps, base))
-    return proj
+    return proj, eps
 
+
+def ntm_figures(base_end: pd.Timestamp, years: list[int], proj: list[dict], eps: list,
+                today: dt.date | None = None) -> dict | None:
+    """Next-twelve-months figures from the model's own projections.
+
+    The window runs from today to today + 12 months. Projected fiscal year i covers
+    (base end + i-1 years, base end + i years]; each year's projected value is weighted by the
+    share of the window it overlaps (time-weighted by days)."""
+    start = pd.Timestamp(today or dt.date.today())
+    end = start + pd.DateOffset(months=12)
+    span = (end - start).days
+    parts = []
+    for i in range(len(proj)):
+        fy_start, fy_end = base_end + pd.DateOffset(years=i), base_end + pd.DateOffset(years=i + 1)
+        days = (min(end, fy_end) - max(start, fy_start)).days
+        if days > 0:
+            parts.append((i, days / span))
+    if not parts or abs(sum(w for _, w in parts) - 1) > 0.01:
+        return None  # window not covered by the projection years
+    out = {"end": end, "parts": [(years[i], w) for i, w in parts]}
+    for k in ("revenue", "ebitda", "fcf"):
+        out[k] = sum(w * proj[i][k] for i, w in parts)
+    out["eps"] = sum(w * eps[i] for i, w in parts) if all(eps[i] is not None for i, _ in parts) else None
+    return out
+
+
+def ntm_basis_text(ntm: dict) -> str:
+    """e.g. "12-month forward basis (to Oct 2027): 17% FY2026E + 83% FY2027E" (weights sum to 100%)."""
+    pcts = [round(w * 100) for _, w in ntm["parts"]]
+    pcts[-1] = 100 - sum(pcts[:-1])
+    mix = " + ".join(f"{pct}% FY{year}E" for (year, _), pct in zip(ntm["parts"], pcts))
+    return f"12-month forward basis (to {ntm['end'].strftime('%b %Y')}): {mix}"
 
 def eps_caption(defaults: dict, years: list[int], eps: list, base: dict) -> str:
     """Where each EPS figure in the chart and table comes from."""
@@ -1333,9 +1391,9 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
     st.header("Discounted Cash Flow")
     c1, c2 = st.columns(2)
     terminal = c1.slider("Terminal growth (%)", 0.0, 5.0, step=0.25,
-                         key=seed_input(ticker, "terminal", 2.5, 0.0, 5.0)) / 100
+                         **bound(seed_input(ticker, "terminal", 2.5, 0.0, 5.0))) / 100
     wacc = c2.slider("WACC / discount rate (%)", 4.0, 20.0, step=0.25,
-                     key=seed_input(ticker, "wacc", 9.0, 4.0, 20.0)) / 100
+                     **bound(seed_input(ticker, "wacc", 9.0, 4.0, 20.0))) / 100
 
     if not proj:
         st.warning("No projection model — DCF cannot be computed.")
@@ -1399,109 +1457,146 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
     return implied if implied > 0 else None
 
 
-def render_price_targets(ticker, m, shares, net_debt, y1: dict | None, year1: int, base_fcf, eps_ttm) -> list[tuple]:
-    """Render the Price Target Setter. Returns [(method, target price)]."""
+def render_price_targets(ticker, m, shares, net_debt, ntm: dict | None, base_fcf, base_label) -> list[tuple]:
+    """Render the Price Target Setter on a 12-month-forward basis. Returns [(method, target price)]."""
     st.header("Price Target Setter")
     price = m["price"]
-    profitable = eps_ttm is not None and eps_ttm > 0
-    auto = "P/E" if profitable else "P/S"
-    st.caption(f"TTM EPS: {fmt_price(eps_ttm)} → auto-selected method: **{auto}** "
-               f"({'profitable' if profitable else 'not profitable'}). Revenue, EBITDA and FCF methods use "
-               f"your {year1}E projections from the model above.")
-    options = ["Auto", "P/E", "P/S"]
-    choice = st.radio("Method", options, horizontal=True,
-                      format_func=lambda o: f"Auto ({auto})" if o == "Auto" else o,
-                      key=seed_input(ticker, "method", "Auto", options=options))
-    method = auto if choice == "Auto" else choice
     results: list[tuple] = []
-
-    def show(label: str, target: float | None, formula: str):
-        col1, col2 = st.columns([1, 2])
-        up = upside(target, price)
-        col1.metric(label, fmt_price(target) if target is not None and target > 0 else "N/A",
-                    delta=fmt_pct(up, signed=True) + " vs current" if up is not None and target > 0 else None)
-        col2.markdown(f"<br/>{formula}", unsafe_allow_html=True)
-        if target is not None and target > 0:
-            results.append((label.replace(" target", ""), target))
-        else:
-            st.warning(f"{label}: inputs produce a non-positive price, excluded from the summary.")
-
+    if not ntm:
+        st.warning("The projection model is unavailable, so 12-month-forward targets cannot be computed.")
+        return results
     if not pos(shares):
         st.warning("Shares outstanding unavailable — per-share targets cannot be computed.")
         return results
 
-    if method == "P/E":
-        default_eps = num(m["eps_fwd"]) if m["eps_fwd"] is not None else (eps_ttm or 0.0)
-        default_pe = pos(m["pe_fwd"]) or pos(m["pe_ttm"]) or 15.0
-        c1, c2 = st.columns(2)
-        eps = c1.number_input("Forecast EPS ($)", step=0.05,
-                              key=seed_input(ticker, "pe_eps", round(float(default_eps), 2)),
-                              help="Default: consensus forward EPS (falls back to TTM EPS).")
-        target_pe = c2.number_input("Target P/E", min_value=0.0, step=0.5,
-                                    key=seed_input(ticker, "pe_mult", round(float(default_pe), 1), lo=0.0), help="Default: current forward P/E.")
-        show("P/E target", eps * target_pe, f"`{eps:,.2f} EPS × {target_pe:,.1f} P/E`")
-    else:
-        if not y1 or not pos(y1["revenue"]):
-            st.warning("Projected revenue unavailable — P/S method cannot be computed.")
+    st.markdown(f"**{ntm_basis_text(ntm)}**")
+    cols = st.columns(4)
+    cols[0].metric("NTM revenue", fmt_money(ntm["revenue"]))
+    cols[1].metric("NTM Adj. EBITDA", fmt_money(ntm["ebitda"]))
+    cols[2].metric("NTM free cash flow", fmt_money(ntm["fcf"]))
+    cols[3].metric("NTM EPS (diluted)", fmt_price(ntm["eps"]))
+    st.caption("NTM = next twelve months from today, calendarized from your projections in the model above. "
+               "Every method below applies a target multiple to these NTM figures, so each result is a "
+               "12-month price target. Target multiples default to the company's multiple today.")
+
+    def target_input(label: str, name: str, today_value, fallback: float, basis: str, step: float) -> float:
+        today_value = pos(today_value)
+        default = round(float(today_value or fallback), 2 if step < 0.5 else 1)
+        note = (f"Default = today's {basis} ({today_value:,.1f}x)" if today_value
+                else f"Default = {fallback:,.1f}x fallback (today's {basis} is unavailable or not meaningful)")
+        value = st.number_input(label, min_value=0.0, step=step, help=note,
+                                **bound(seed_input(ticker, name, default, lo=0.0)))
+        st.caption(note)
+        return value
+
+    def show(label: str, target: float, formula: str):
+        col1, col2 = st.columns([1, 2])
+        up = upside(target, price)
+        col1.metric(f"{label} 12-month target", fmt_price(target) if target > 0 else "N/A",
+                    delta=fmt_pct(up, signed=True) + " vs current" if up is not None and target > 0 else None)
+        col2.markdown(f"<br/>{formula}", unsafe_allow_html=True)
+        if target > 0:
+            results.append((label, target))
         else:
-            target_ps = st.number_input("Target P/S", min_value=0.0, step=0.1,
-                                        key=seed_input(ticker, "ps_mult", round(float(pos(m["ps"]) or 2.0), 2),
-                                                       lo=0.0), help="Default: current P/S.")
-            show("P/S target", y1["revenue"] / shares * target_ps,
-                 f"`({fmt_money(y1['revenue'])} {year1}E revenue ÷ {shares / 1e6:,.1f}M shares) "
-                 f"× {target_ps:,.2f} P/S`")
+            st.warning(f"{label}: inputs produce a non-positive price, excluded from the summary.")
 
-        if y1 and pos(y1["ebitda"]):
-            st.markdown(f"**EV/Adj. EBITDA method** ({year1}E Adjusted EBITDA is positive)")
-            target_mult = st.number_input("Target EV/Adj. EBITDA", min_value=0.0, step=0.5,
-                                          key=seed_input(ticker, "ev_mult",
-                                                         round(float(pos(m["ev_ebitda"]) or 12.0), 1), lo=0.0), help="Default: current EV / TTM Adjusted EBITDA.")
-            target = (y1["ebitda"] * target_mult - (net_debt or 0.0)) / shares
-            show("EV/Adj. EBITDA target", target,
-                 f"`({fmt_money(y1['ebitda'])} {year1}E Adj. EBITDA × {target_mult:,.1f} − "
-                 f"{fmt_money(net_debt or 0)} net debt) ÷ {shares / 1e6:,.1f}M shares`")
+    per_share = f"{shares / 1e6:,.1f}M shares"
+    if pos(ntm["eps"]):
+        st.subheader("P/E method")
+        mult = target_input("Target P/E", "pe_mult", pos(m["pe_fwd"]) or pos(m["pe_ttm"]), 15.0,
+                            "forward P/E" if pos(m["pe_fwd"]) else "trailing P/E", 0.5)
+        show("P/E", ntm["eps"] * mult, f"`{fmt_price(ntm['eps'])} NTM EPS × {mult:,.1f} P/E`")
+    else:
+        st.subheader("P/S method")
+        st.caption("Used because NTM EPS is not positive, so a P/E target is not meaningful.")
+        mult = target_input("Target P/S", "ps_mult", m["ps"], 2.0, "P/S (TTM revenue)", 0.1)
+        show("P/S", ntm["revenue"] / shares * mult,
+             f"`({fmt_money(ntm['revenue'])} NTM revenue ÷ {per_share}) × {mult:,.2f} P/S`")
 
-    if y1 and pos(y1["fcf"]):
-        st.markdown(f"**Price / FCF method** ({year1}E free cash flow is positive)")
-        current_pfcf = safe_div(m["market_cap"], base_fcf) if pos(base_fcf) else None
-        default_pfcf = current_pfcf if current_pfcf and current_pfcf <= 100 else 20.0
-        target_pfcf = st.number_input("Target Price / FCF", min_value=0.0, step=0.5,
-                                      key=seed_input(ticker, "pfcf_mult", round(float(default_pfcf), 1), lo=0.0), help="Default: current Price/FCF.")
-        show("FCF target", y1["fcf"] / shares * target_pfcf,
-             f"`({fmt_money(y1['fcf'])} {year1}E FCF ÷ {shares / 1e6:,.1f}M shares) × {target_pfcf:,.1f} P/FCF`")
+    if pos(ntm["ebitda"]):
+        st.subheader("EV / Adj. EBITDA method")
+        mult = target_input("Target EV/Adj. EBITDA", "ev_mult", m["ev_ebitda"], 12.0,
+                            "EV / TTM Adjusted EBITDA", 0.5)
+        nd = net_debt or 0.0
+        # Subtracting net debt; with net cash (negative net debt) that is an addition.
+        bridge = f"− net debt of {fmt_money(nd)}" if nd >= 0 else f"+ net cash of {fmt_money(-nd)}"
+        show("EV/Adj. EBITDA", (ntm["ebitda"] * mult - nd) / shares,
+             f"`({fmt_money(ntm['ebitda'])} NTM Adj. EBITDA × {mult:,.1f} {bridge}) ÷ {per_share}`")
+
+    if pos(ntm["fcf"]):
+        st.subheader("Price / FCF method")
+        today_pfcf = safe_div(m["market_cap"], base_fcf) if pos(base_fcf) else None
+        mult = target_input("Target Price / FCF", "pfcf_mult", today_pfcf if today_pfcf and today_pfcf <= 100 else None,
+                            20.0, f"Price / FCF (market cap ÷ {base_label} FCF)", 0.5)
+        show("P/FCF", ntm["fcf"] / shares * mult,
+             f"`({fmt_money(ntm['fcf'])} NTM FCF ÷ {per_share}) × {mult:,.1f} P/FCF`")
     return results
 
 
-def render_summary(rows: list[tuple], price) -> None:
+def render_summary(dcf_price: float | None, multiples: list[tuple], price) -> None:
+    """Three blocks: intrinsic value today, the 12-month multiples target, and a mixed-horizon blend."""
     st.header("Summary")
-    if not rows:
-        st.warning("No valuation method produced a positive price target for this company.")
-        return
-    blended = sum(p for _, p in rows) / len(rows)
-    table = pd.DataFrame(
-        [{"Method": name, "Target price": fmt_price(p), "Upside / downside": fmt_pct(upside(p, price), signed=True)}
-         for name, p in rows]
-        + [{"Method": "Blended target (simple average)", "Target price": fmt_price(blended),
-            "Upside / downside": fmt_pct(upside(blended, price), signed=True)}]
-    ).set_index("Method")
-    st.dataframe(table, width="stretch")
-    up = upside(blended, price)
-    st.metric("Blended target", fmt_price(blended),
-              delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
+    left, right = st.columns(2)
+    with left.container(border=True):
+        st.markdown("**Intrinsic Value (DCF) — value today**")
+        if dcf_price:
+            up = upside(dcf_price, price)
+            st.metric("DCF implied price", fmt_price(dcf_price),
+                      delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
+        else:
+            st.metric("DCF implied price", "N/A")
+            st.caption("No DCF value: it is hidden for banks/insurers or not meaningful for this company's cash flows.")
+    with right.container(border=True):
+        if len(multiples) >= 2:
+            names = ", ".join(n for n, _ in multiples)
+            target = sum(p for _, p in multiples) / len(multiples)
+            st.markdown("**12-Month Price Target — multiples average**")
+            label, note = "12-month target (average)", f"Simple average of {len(multiples)} NTM methods: {names}."
+        elif len(multiples) == 1:
+            name, target = multiples[0]
+            st.markdown(f"**12-Month Price Target — {name}**")
+            label, note = f"12-month target ({name})", f"{name} is the only multiples method that applies, so this is its value."
+        else:
+            target = None
+            st.markdown("**12-Month Price Target**")
+            label, note = "12-month target", "No multiples method produced a positive 12-month target."
+        up = upside(target, price) if target else None
+        st.metric(label, fmt_price(target) if target else "N/A",
+                  delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
+        st.caption(note)
+
+    rows = ([("DCF", "Intrinsic value today", dcf_price)] if dcf_price else []) + \
+           [(n, "12-month target (NTM)", p) for n, p in multiples]
+    if rows:
+        st.dataframe(pd.DataFrame(
+            [{"Method": n, "Horizon": h, "Target price": fmt_price(p),
+              "Upside / downside": fmt_pct(upside(p, price), signed=True)} for n, h, p in rows]
+        ).set_index("Method"), width="stretch")
+    if len(rows) >= 2:
+        blended = sum(p for _, _, p in rows) / len(rows)
+        up = upside(blended, price)
+        st.caption(md_escape(
+            f"Blended (all methods — mixed horizon): {fmt_price(blended)}"
+            + (f" ({fmt_pct(up, signed=True)} vs current)" if up is not None else "")
+            + f" — simple average of {len(rows)} methods; it mixes the DCF value today with 12-month targets."))
 
 
 def render_how_it_works() -> None:
+    has_fmp = bool(get_secret("FMP_API_KEY"))
+    source = st.session_state.get("_data_source") or ("Financial Modeling Prep" if has_fmp else "yfinance")
+    provider = "the data provider (Financial Modeling Prep, else yfinance)" if has_fmp else "yfinance"
     with st.expander("How this works"):
         st.markdown("**Data.** The base (Actual) year comes from SEC EDGAR Company Facts (US-GAAP XBRL): the most "
                     "recent fiscal year, keeping only the latest filing for that period so restated or repeated "
-                    "figures are not double counted. Price, profile, ratios and analyst consensus come from "
-                    "Financial Modeling Prep (or yfinance). Everything is cached for 24 hours.")
+                    f"figures are not double counted. Price, profile, ratios and analyst consensus come from "
+                    f"{source}" + ("" if has_fmp else " (no Financial Modeling Prep API key is configured)")
+                    + ". Everything is cached for 24 hours.")
         st.markdown("**Base year (Actual)**")
         st.latex(r"FCF_0 = \text{Operating Cash Flow} - \text{Capex}")
         st.latex(r"\text{Adjusted EBITDA} = \text{EBITDA (excl. unusual items)} + "
                  r"\text{Stock-Based Compensation}")
         st.markdown("Adjusted EBITDA is used everywhere EBITDA appears (model, margins, EV/Adj. EBITDA, FCF "
-                    "conversion). The EBITDA part is the data provider's normalized EBITDA (FMP or yfinance), "
+                    "conversion). " f"The EBITDA part is the normalized EBITDA from {provider}, "
                     "or its reported EBITDA when no normalized figure exists. For the base year the stock-based "
                     "compensation add-back is SEC EDGAR's ShareBasedCompensation, disclosed in the model "
                     "footnote. EDGAR operating income + D&A is used only when the provider has no EBITDA. "
@@ -1522,7 +1617,7 @@ def render_how_it_works() -> None:
         st.markdown("**EPS tracker** (diluted, $ per share)")
         st.latex(r"EPS_t = \text{consensus average EPS}_t \quad \text{(years covered by analysts)}")
         st.latex(r"EPS_t = EPS_{t-1} \times \frac{EBITDA_t}{EBITDA_{t-1}} \quad \text{(later years)}")
-        st.markdown("Consensus EPS comes from FMP, else yfinance. EPS is shown as N/A when the prior year's EPS "
+        st.markdown(f"Consensus EPS comes from {provider}. EPS is shown as N/A when the prior year's EPS "
                     "or EBITDA is not positive, so a loss is never compounded.")
         st.markdown("**DCF** (r = WACC, g_T = terminal growth)")
         st.latex(r"PV(FCF_t) = \frac{FCF_t}{(1+r)^t}")
@@ -1531,22 +1626,29 @@ def render_how_it_works() -> None:
         st.latex(r"\text{Equity} = EV - (\text{Total Debt} - \text{Cash}) \qquad "
                  r"\text{Implied Price} = \frac{\text{Equity}}{\text{Shares Outstanding}}")
         st.latex(r"\text{Upside} = \frac{\text{Target}}{\text{Current Price}} - 1")
-        st.markdown("**Price target methods** (year-1 figures come from the projection model)")
-        st.latex(r"\text{P/E target} = \text{Forecast EPS} \times \text{Target P/E}")
-        st.latex(r"\text{P/S target} = \frac{Revenue_1}{\text{Shares}} \times \text{Target P/S}")
-        st.latex(r"\text{EV/EBITDA target} = \frac{EBITDA_1 \times \text{Target EV/EBITDA} "
-                 r"- \text{Net Debt}}{\text{Shares}}")
-        st.latex(r"\text{P/FCF target} = \frac{FCF_1}{\text{Shares}} \times \text{Target P/FCF}")
-        st.latex(r"\text{Blended} = \frac{1}{n}\sum_{i=1}^{n} \text{Target}_i")
+        st.markdown("**12-month-forward (NTM) figures.** The window runs from today to today + 12 months. "
+                    "Each projected fiscal year is weighted by the share of the window it overlaps, so a window "
+                    "with 2 months left in FY1 and 10 months in FY2 is 17% FY1 + 83% FY2.")
+        st.latex(r"X_{NTM} = \sum_{t} w_t \, X_t \qquad w_t = \frac{\text{days of FY}_t \text{ inside the window}}"
+                 r"{\text{days in the window}} \qquad X \in \{Revenue,\ Adj.\ EBITDA,\ FCF,\ EPS\}")
+        st.markdown("**12-month price targets** (target multiples default to the company's multiple today)")
+        st.latex(r"\text{P/E} = EPS_{NTM} \times \text{Target P/E} \quad (EPS_{NTM} > 0)")
+        st.latex(r"\text{P/S} = \frac{Revenue_{NTM}}{\text{Shares}} \times \text{Target P/S} "
+                 r"\quad (\text{used when } EPS_{NTM} \le 0)")
+        st.latex(r"\text{EV/Adj. EBITDA} = \frac{\text{Adj. EBITDA}_{NTM} \times \text{Target multiple} "
+                 r"- \text{Net Debt}}{\text{Shares}} \quad (\text{Adj. EBITDA}_{NTM} > 0)")
+        st.latex(r"\text{P/FCF} = \frac{FCF_{NTM}}{\text{Shares}} \times \text{Target P/FCF} \quad (FCF_{NTM} > 0)")
+        st.markdown("**Horizons.** The DCF gives intrinsic value *today*. The multiples methods give a *12-month* "
+                    "price target; when two or more apply, the 12-month target is their simple average, and when "
+                    "only one applies it is that method's value. The blended line averages all methods and mixes "
+                    "both horizons, so it is shown only as a secondary reference.")
         st.markdown("**Snapshot multiples**")
         st.latex(r"P/E = \frac{Price}{EPS} \quad PEG = \frac{P/E}{\text{EPS growth (\%)}} \quad "
                  r"P/S = \frac{\text{Mkt Cap}}{\text{Revenue}} \quad P/B = \frac{Price}{\text{Book/Share}}")
         st.latex(r"EV = \text{Mkt Cap} + \text{Debt} - \text{Cash} \quad EV/Sales \quad EV/EBITDA \quad "
                  r"\text{FCF Yield} = \frac{FCF}{\text{Mkt Cap}}")
-        st.markdown("The auto method is **P/E** when TTM EPS > 0, otherwise **P/S** (plus **EV/EBITDA** when "
-                    "year-1 EBITDA > 0). **P/FCF** is added whenever year-1 FCF > 0. Total debt is approximate: "
-                    "long-term debt (including current portion) plus short-term borrowings/commercial paper; "
-                    "cash excludes marketable securities.")
+        st.markdown("Total debt is approximate: long-term debt (including current portion) plus short-term "
+                    "borrowings/commercial paper; cash excludes marketable securities.")
 
 
 def render_footer() -> None:
@@ -1667,23 +1769,45 @@ def main() -> str | None:
     if "ticker_query" not in st.session_state:
         st.session_state["ticker_query"] = (items or {}).get(LAST_TICKER_ITEM) or "AAPL"
 
-    query = st.text_input("Search by ticker or company name", key="ticker_query",
-                          placeholder="e.g. MSFT, NVDA, Coca-Cola")
+    query = st.text_input("Search by ticker or company name", placeholder="e.g. MSFT, NVDA, Coca-Cola",
+                          **bound("ticker_query"))
     ticker = resolve_ticker(query)
     if not ticker:
         st.info("Enter a ticker symbol or company name to begin.")
         return None
 
-    with st.spinner(f"Loading {ticker}…"):
-        m, source, warnings = get_market_data(ticker)
-        cik = lookup_cik(ticker)
-        edgar: dict = {"history": pd.DataFrame(), "note": "Ticker not found in the SEC company list."}
-        if cik is not None:
-            try:
-                edgar = edgar_fundamentals(cik)
-            except Exception as exc:
-                edgar = {"history": pd.DataFrame(), "note": f"SEC EDGAR request failed ({type(exc).__name__})."}
+    # Everything for this ticker renders into one block at this position. On a ticker change an
+    # st.empty() slot replaces the previous ticker's sections with a loading state at once, and the
+    # new heading appears only together with its own data, after every fetch has finished.
+    # Same-ticker reruns (input edits) use a plain container so the page updates in place;
+    # st.empty() would blank the block on every rerun, collapsing the page and its scroll position.
+    new_ticker = st.session_state.get("_shown_ticker") != ticker
+    slot = st.empty() if new_ticker else None
+    if slot is not None:
+        slot.html(loading_html(ticker))
+    m, source, warnings = get_market_data(ticker)
+    cik = lookup_cik(ticker)
+    edgar: dict = {"history": pd.DataFrame(), "note": "Ticker not found in the SEC company list."}
+    if cik is not None:
+        try:
+            edgar = edgar_fundamentals(cik)
+        except Exception as exc:
+            edgar = {"history": pd.DataFrame(), "note": f"SEC EDGAR request failed ({type(exc).__name__})."}
+    yf_est = None
+    fmp_est = m.get("estimates") or []
+    if (m["price"] or not edgar["history"].empty) and not any(e.get("eps") is not None for e in fmp_est):
+        try:
+            yf_est = yf_estimates(ticker)
+        except Exception:
+            yf_est = None
+    st.session_state["_data_source"] = source
+    st.session_state["_shown_ticker"] = ticker
+    with slot.container() if slot is not None else st.container():
+        return render_ticker(ticker, m, source, warnings, edgar, yf_est)
 
+
+def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict, yf_est) -> str | None:
+    """All sections for one ticker, rendered after its data has loaded."""
     if not m["price"] and edgar["history"].empty:
         st.error(f"Could not find data for **{ticker}**. Check the ticker symbol and try again.")
         return None
@@ -1767,15 +1891,9 @@ def main() -> str | None:
 
     # ---- 3. Projection model (1 actual year + 5 projected years)
     years = [base["end"].year + i for i in range(1, YEARS + 1)]
-    yf_est = None
-    fmp_est = m.get("estimates") or []
-    if not fmp_est or not any(e.get("eps") is not None for e in fmp_est):
-        try:
-            yf_est = yf_estimates(ticker)
-        except Exception:
-            yf_est = None
     defaults = build_defaults(base, years, m.get("estimates"), yf_est)
-    proj = render_model(ticker, base, defaults, years)
+    model = render_model(ticker, base, defaults, years)
+    proj, eps = model if model else (None, None)
 
     # ---- 4. DCF
     dcf_price = None
@@ -1789,15 +1907,12 @@ def main() -> str | None:
         st.header("Discounted Cash Flow")
         st.info("DCF hidden for this financial company — see the warning above.")
 
-    # ---- 5. Price targets
-    rows: list[tuple] = []
-    if dcf_price:
-        rows.append(("DCF", dcf_price))
-    rows += render_price_targets(ticker, m, shares, net_debt, proj[0] if proj else None, years[0],
-                                 base["fcf"], eps_ttm)
+    # ---- 5. Price targets (12-month forward)
+    ntm = ntm_figures(base["end"], years, proj, eps) if proj else None
+    multiples = render_price_targets(ticker, m, shares, net_debt, ntm, base["fcf"], base["label"])
 
     # ---- 6. Summary
-    render_summary(rows, price)
+    render_summary(dcf_price, multiples, price)
     return ticker
 
 
