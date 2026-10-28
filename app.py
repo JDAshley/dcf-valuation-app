@@ -2106,6 +2106,8 @@ def render_topnav(active: str) -> None:
 # --------------------------------------------------------------------------- #
 CALC_ITEM = "dcf_calc"
 HOLDINGS_ITEM = "dcf_holdings"
+UI_ITEM = "dcf_ui"                   # small UI preferences, e.g. whether the holdings editor is open
+PF_EDITOR_KEY = "pf_editor_open"
 CALC_DEFAULTS = {"calc_mode": "Calculator", "calc_start": 1000.0, "calc_monthly": 200.0, "calc_return": 8.0,
                  "calc_years": 20, "calc_increase": 0.0, "goal_target": 100000.0, "goal_years": 10,
                  "goal_start": 1000.0, "goal_return": 8.0}
@@ -2202,6 +2204,12 @@ def global_writes(items: dict) -> dict:
                 writes[CALC_ITEM] = None
         elif set(saved) != set(values) or not all(_same(values[k], saved[k]) for k in values):
             writes[CALC_ITEM] = json.dumps(values)
+    if _RUN.get("pf_editor") and PF_EDITOR_KEY in st.session_state:
+        saved = stored_json(UI_ITEM, {})
+        saved = saved if isinstance(saved, dict) else {}
+        is_open = bool(st.session_state[PF_EDITOR_KEY])
+        if is_open != bool(saved.get(PF_EDITOR_KEY, False)):
+            writes[UI_ITEM] = json.dumps({**saved, PF_EDITOR_KEY: is_open})
     if "holdings" in st.session_state:
         current = st.session_state["holdings"]
         stored = stored_json(HOLDINGS_ITEM, None)
@@ -2938,6 +2946,29 @@ def _add_from_form() -> None:
 def render_portfolio() -> None:
     hl = holdings()
     st.caption(PRIVACY_NOTE)
+    # The editor is collapsed by default; the user's open/closed choice is remembered in this browser.
+    if PF_EDITOR_KEY not in st.session_state:
+        saved = stored_json(UI_ITEM, {})
+        st.session_state[PF_EDITOR_KEY] = bool(saved.get(PF_EDITOR_KEY)) if isinstance(saved, dict) else False
+    _RUN["pf_editor"] = True
+    with st.expander("✏️ Edit holdings", expanded=st.session_state[PF_EDITOR_KEY], key=PF_EDITOR_KEY,
+                     on_change="rerun"):
+        render_holdings_editor(hl)
+    if not hl:
+        st.info("No holdings yet — open ✏️ Edit holdings above to add a ticker.")
+        return
+
+    quotes = {h["ticker"]: live_quote(h["ticker"]) for h in hl}
+    oldest = min(q["fetched_at"] for q in quotes.values())
+    c = st.columns([3, 1], vertical_alignment="center")
+    c[0].caption(f"Prices as of {dt.datetime.fromtimestamp(oldest, dt.timezone.utc).strftime('%b %d, %H:%M UTC')} "
+                 "(yfinance, refreshed every 5 minutes).")
+    c[1].button("↻ Refresh prices", key="pf_refresh", on_click=live_quote.clear, width="stretch")
+    _portfolio_stats(hl, quotes)
+
+
+def render_holdings_editor(hl: list[dict]) -> None:
+    """Add/remove holdings and edit shares and average cost (inside the collapsible editor)."""
     with st.form("pf_add", clear_on_submit=True, border=False):
         c = st.columns([1.2, 1, 1, 0.8], vertical_alignment="bottom")
         c[0].text_input("Ticker", key="pf_new_ticker", placeholder="e.g. MSFT")
@@ -2947,16 +2978,7 @@ def render_portfolio() -> None:
     if st.session_state.pop("_pf_error", None):
         st.warning("That doesn't look like a ticker symbol.")
     if not hl:
-        st.info("No holdings yet — add a ticker above.")
         return
-
-    quotes = {h["ticker"]: live_quote(h["ticker"]) for h in hl}
-    oldest = min(q["fetched_at"] for q in quotes.values())
-    c = st.columns([3, 1], vertical_alignment="center")
-    c[0].caption(f"Prices as of {dt.datetime.fromtimestamp(oldest, dt.timezone.utc).strftime('%b %d, %H:%M UTC')} "
-                 "(yfinance, refreshed every 5 minutes).")
-    c[1].button("↻ Refresh prices", key="pf_refresh", on_click=live_quote.clear, width="stretch")
-
     st.markdown("**Holdings** — tap a ticker to open it in Valuation; shares and cost are optional.")
     with st.container(key="pf_rows"):
         for h in hl:
@@ -2974,6 +2996,9 @@ def render_portfolio() -> None:
                            width="stretch")
             h["shares"], h["cost"] = st.session_state[f"pf_sh_{t}"], st.session_state[f"pf_cost_{t}"]
 
+
+def _portfolio_stats(hl: list[dict], quotes: dict) -> None:
+    """Summary tiles, holdings table, tap-through row and allocation chart."""
     rows, counted = [], []
     for h in hl:
         q = quotes[h["ticker"]]
@@ -3020,6 +3045,12 @@ def render_portfolio() -> None:
     if any(q["price"] is None for q in quotes.values()):
         bad = ", ".join(t for t, q in quotes.items() if q["price"] is None)
         st.caption(f"No price available for {bad} — check the symbol. Other holdings are unaffected.")
+    # Tap-through to Valuation stays available while the editor is collapsed.
+    with st.container(horizontal=True, key="pf_open_row", vertical_alignment="center"):
+        st.caption("Open in Valuation:")
+        for h in hl:
+            st.button(f"{h['ticker']} ↗", key=f"pf_open_{h['ticker']}", on_click=open_in_valuation, args=(h["ticker"],),
+                      type="tertiary")
 
     if counted:
         try:
