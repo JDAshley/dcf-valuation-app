@@ -1906,7 +1906,8 @@ def render_how_it_works() -> None:
         st.markdown("D&A, capex and ΔNWC are revenue × their %; tax is applied once to EBIT with no floor (a negative "
                     "EBIT gives a tax benefit). Defaults come from the latest fiscal year on SEC EDGAR: D&A ÷ revenue, "
                     "capex ÷ revenue, the change in operating working capital ((current assets − cash) − (current "
-                    "liabilities − current debt)) ÷ revenue, positive meaning cash outflow (0.0 if the tags are missing), "
+                    "liabilities − current debt)) ÷ revenue averaged over up to the three latest fiscal years, positive "
+                    "meaning cash outflow (0.0 if the tags are missing), "
                     "and tax expense ÷ pre-tax income clamped to 0–40% (21% if pre-tax income is not positive). Projected "
                     "EPS = NOPAT ÷ diluted shares. If EDGAR lacks D&A or capex, the **Simple** build is used instead, "
                     "and it can be chosen manually:")
@@ -1986,7 +1987,7 @@ def render_footer() -> None:
 
 
 def detailed_components(history: pd.DataFrame, base: dict) -> dict:
-    """Default D&A %, capex %, ΔNWC % and tax rate for the detailed build, from the latest EDGAR fiscal year."""
+    """Default D&A %, capex % and tax rate for the detailed build from the latest EDGAR fiscal year; ΔNWC % from up to three."""
     comp = {"available": False}
     if history.empty or not pos(base.get("revenue")):
         return comp
@@ -1997,11 +1998,22 @@ def detailed_components(history: pd.DataFrame, base: dict) -> dict:
         return comp
     comp.update(available=True, da=da, capex=capex, da_pct=da / rev * 100, capex_pct=capex / rev * 100)
     nwc_now, nwc_prev = num(row.get("Operating NWC")), num(prev.get("Operating NWC")) if prev is not None else None
-    if nwc_now is not None and nwc_prev is not None:
-        comp.update(dnwc=nwc_now - nwc_prev, nwc_pct=(nwc_now - nwc_prev) / rev * 100,
-                    nwc_note=f"{fy} change in operating working capital, SEC EDGAR; positive = cash outflow")
+    comp["dnwc"] = nwc_now - nwc_prev if nwc_now is not None and nwc_prev is not None else None  # base-year actual
+    # Default: average ΔNWC % of revenue over up to the three latest fiscal years (base year and the two before it).
+    per_year = []
+    for k in range(len(history) - 1, max(len(history) - 4, 0), -1):
+        cur, before = history.iloc[k], history.iloc[k - 1]
+        now, then = num(cur.get("Operating NWC")), num(before.get("Operating NWC"))
+        year_rev = rev if k == len(history) - 1 else num(cur.get("Revenue"))
+        if now is not None and then is not None and pos(year_rev):
+            per_year.append((history.index[k], (now - then) / year_rev * 100))
+    if per_year:
+        used = ", ".join(f"{label} {v:.2f}%" for label, v in reversed(per_year))
+        comp.update(nwc_pct=sum(v for _, v in per_year) / len(per_year), nwc_years=per_year,
+                    nwc_note=f"{len(per_year)}-year average of the change in operating working capital ÷ revenue "
+                             f"({used}), SEC EDGAR; positive = cash outflow")
     else:
-        comp.update(dnwc=None, nwc_pct=0.0,
+        comp.update(nwc_pct=0.0, nwc_years=[],
                     nwc_note="defaulted to 0.0 — working-capital tags were not available on SEC EDGAR")
     tax, pre = num(row.get("Income tax")), num(row.get("Pretax income"))
     if tax is not None and pos(pre):
