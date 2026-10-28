@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import base64
 import datetime as dt
+import difflib
 import functools
 import html
 import io
@@ -1788,6 +1789,7 @@ def main() -> str | None:
     view = st.session_state.get("view", "valuation")
     st.html(app_css())  # texture, tab bar, compact grids; style-only HTML takes no layout space
     render_header(VIEW_TITLES[view])
+    render_topnav(view)
 
     # Saved inputs live in the browser, which reports them a moment after the
     # first run. Wait for them so widgets start from saved values, not defaults.
@@ -1981,32 +1983,39 @@ APP_CSS = f"""
         padding-bottom: 0.55rem; }}
     .st-key-row_g > div:last-child, .st-key-row_m > div:last-child {{ flex: 1 1 auto !important; min-width: 0 !important; width: auto !important; }}
 }}
-[data-testid="stMainBlockContainer"] {{ padding-bottom: calc(120px + env(safe-area-inset-bottom, 0px)) !important; }}
 /* Content surfaces stay solid over the texture. */
 [data-testid="stExpander"] details, [data-testid="stPlotlyChart"], .st-key-sbc_proj, .st-key-sbc_dcf,
 .st-key-sum_dcf, .st-key-sum_ntm, .st-key-pf_rows, .feed-card {{ background-color: var(--jd-base); }}
 
-/* Bottom tab bar */
-.st-key-tabbar {{
-    position: fixed !important; left: 50%; transform: translateX(-50%); bottom: 0; z-index: 999990;
-    width: min(640px, 100%); box-sizing: border-box; gap: 0 !important;
-    background: {NAVY}; border-top: 1px solid rgba(179, 139, 34, 0.55); border-radius: 14px 14px 0 0;
-    padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px)) 8px !important;
-    box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.25);
-}}
-.st-key-tabbar [data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap !important; flex-direction: row !important; gap: 4px !important; }}
-.st-key-tabbar [data-testid="stColumn"] {{ min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }}
-.st-key-tabbar button {{
-    background: transparent !important; border: 0 !important; color: #ffffff !important;
-    min-height: 46px; padding: 4px 2px !important; border-radius: 10px !important; box-shadow: none !important;
-}}
-.st-key-tabbar button p {{ font-size: 0.82rem; font-weight: 600; line-height: 1.15; white-space: normal; color: inherit; }}
-.st-key-tabbar button[data-testid="stBaseButton-primary"] {{ background: {GOLD} !important; color: {NAVY} !important; }}
+/* Top navigation: a segmented control on the page background, sticky just below Streamlit's toolbar
+   (3.75rem tall), so it never covers the toolbar's menu. Desktop and phone variants differ only in labels. */
+.st-key-topnav_mob, [data-testid="stLayoutWrapper"]:has(> .st-key-topnav_mob) {{ display: none !important; }}
+[data-testid="stLayoutWrapper"]:has(> .st-key-topnav_desk), [data-testid="stLayoutWrapper"]:has(> .st-key-topnav_mob) {{
+    position: sticky; top: 3.75rem; z-index: 50; }}
+.st-key-topnav_desk, .st-key-topnav_mob {{
+    background: var(--jd-base); border: 1px solid rgba(179, 139, 34, 0.45); border-radius: 12px;
+    padding: 4px !important; gap: 0 !important; box-sizing: border-box; }}
+.st-key-topnav_desk [data-testid="stHorizontalBlock"], .st-key-topnav_mob [data-testid="stHorizontalBlock"] {{
+    flex-wrap: nowrap !important; flex-direction: row !important; gap: 4px !important; }}
+.st-key-topnav_desk [data-testid="stColumn"], .st-key-topnav_mob [data-testid="stColumn"] {{
+    min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }}
+.st-key-topnav_desk button, .st-key-topnav_mob button {{
+    background: transparent !important; border: 0 !important; box-shadow: none !important; color: inherit !important;
+    min-height: 38px; padding: 4px 6px !important; border-radius: 9px !important; }}
+.st-key-topnav_desk button p, .st-key-topnav_mob button p {{
+    font-size: 0.9rem; font-weight: 600; line-height: 1.1; white-space: nowrap; opacity: 0.72; }}
+.st-key-topnav_desk button[data-testid="stBaseButton-primary"], .st-key-topnav_mob button[data-testid="stBaseButton-primary"] {{
+    background: {GOLD} !important; }}
+.st-key-topnav_desk button[data-testid="stBaseButton-primary"] p, .st-key-topnav_mob button[data-testid="stBaseButton-primary"] p {{
+    color: #1c1508 !important; opacity: 1; }}
 
 /* Compact year grids (Projection Assumptions, SBC %) */
 @media (max-width: 767px) {{
-    .st-key-tabbar {{ width: 100%; border-radius: 0; padding-left: 4px !important; padding-right: 4px !important; }}
-    .st-key-tabbar button p {{ font-size: 0.72rem; }}
+    .st-key-topnav_desk, [data-testid="stLayoutWrapper"]:has(> .st-key-topnav_desk) {{ display: none !important; }}
+    .st-key-topnav_mob {{ display: flex !important; }}
+    [data-testid="stLayoutWrapper"]:has(> .st-key-topnav_mob) {{ display: flex !important; }}
+    .st-key-topnav_mob button {{ padding: 4px 2px !important; }}
+    .st-key-topnav_mob button p {{ font-size: 0.8rem; }}
     .st-key-grid_g [data-testid="stHorizontalBlock"], .st-key-grid_m [data-testid="stHorizontalBlock"],
     .st-key-grid_s [data-testid="stHorizontalBlock"] {{
         flex-wrap: wrap !important; flex-direction: row !important; gap: 0.5rem !important; }}
@@ -2080,12 +2089,16 @@ def set_view(view: str) -> None:
     st.session_state["view"] = view
 
 
-def render_tabbar(active: str) -> None:
-    """Fixed bottom navigation (positioned by CSS, so its place in the page does not matter)."""
-    with st.container(key="tabbar"):
-        for col, (view, label) in zip(st.columns(len(VIEWS)), VIEWS):
-            col.button(label, key=f"tab_{view}", type="primary" if view == active else "secondary",
-                       on_click=set_view, args=(view,), width="stretch")
+NAV_SHORT = {"valuation": "📊 Value", "compounding": "🧮 Growth", "feed": "📰 Feed", "portfolio": "💼 Portfolio"}
+
+
+def render_topnav(active: str) -> None:
+    """Segmented view switcher under the header: full labels on desktop, short labels on phones."""
+    for key, prefix, labels in (("topnav_desk", "tab", dict(VIEWS)), ("topnav_mob", "tabm", NAV_SHORT)):
+        with st.container(key=key):
+            for col, (view, _) in zip(st.columns(len(VIEWS)), VIEWS):
+                col.button(labels[view], key=f"{prefix}_{view}", type="primary" if view == active else "secondary",
+                           on_click=set_view, args=(view,), width="stretch")
 
 
 # --------------------------------------------------------------------------- #
@@ -2578,28 +2591,174 @@ def feed_news(ticker: str) -> dict:
         return {"items": [], "error": type(exc).__name__, "fetched_at": fetched}
 
 
+SOCIAL_DAILY_CAP = 8   # social posts per ticker per day in the merged feed
+NEWS_CAP = 10          # news items per ticker; filings are not capped
+CASHTAG_RE = re.compile(r"\$[A-Za-z][A-Za-z0-9.\-]{0,9}")
+URL_RE = re.compile(r"https?://\S+")
+MENTION_RE = re.compile(r"@\w+")
+LEADING_CASHTAGS_RE = re.compile(r"^(?:\s*\$[A-Za-z][A-Za-z0-9.\-]{0,9})*\s*")
+
+
+def _empty_stats() -> dict:
+    return {"fetched": 0, "replies": 0, "reshares": 0, "spam": {}}
+
+
+def social_filter(posts: list[dict]) -> tuple[list[dict], dict]:
+    """Keep original posts only, then drop spam. A check that cannot run (missing field) keeps the post.
+
+    Not original: replies (reply metadata, or text that opens with an @mention after any leading
+    cashtags) and reshares/retweets. Spam: more than 4 cashtags; no words beyond cashtags, links,
+    mentions or emoji; identical text from any author; near-identical text (90%+) from the same author."""
+    stats = _empty_stats()
+    stats["fetched"] = len(posts)
+    kept, seen_text, by_author = [], set(), {}
+    for p in posts:
+        try:
+            if p.get("is_reshare"):
+                stats["reshares"] += 1
+                continue
+            if p.get("is_reply") or LEADING_CASHTAGS_RE.sub("", p["body"]).startswith("@"):
+                stats["replies"] += 1
+                continue
+        except Exception:
+            pass
+        reason = None
+        try:
+            body = p["body"]
+            words = MENTION_RE.sub(" ", CASHTAG_RE.sub(" ", URL_RE.sub(" ", body)))
+            norm = " ".join(re.sub(r"[^\w\s]", " ", URL_RE.sub(" ", body.lower())).split())
+            if len(CASHTAG_RE.findall(body)) > 4:
+                reason = "more than 4 cashtags"
+            elif not re.search(r"[A-Za-z0-9]", words):
+                reason = "no text beyond cashtags/links"
+            elif norm in seen_text:
+                reason = "duplicate text"
+            elif any(difflib.SequenceMatcher(None, norm, prev).ratio() >= 0.9 for prev in by_author.get(p.get("user"), [])):
+                reason = "near-duplicate from the same author"
+            else:
+                seen_text.add(norm)
+                by_author.setdefault(p.get("user"), []).append(norm)
+        except Exception:
+            reason = None
+        if reason:
+            stats["spam"][reason] = stats["spam"].get(reason, 0) + 1
+            continue
+        kept.append(p)
+    return kept, stats
+
+
+def _post_item(ticker: str, p: dict) -> dict:
+    body = p["body"]
+    return {"source": "Posts", "ticker": ticker, "title": body[:280] + ("…" if len(body) > 280 else ""),
+            "meta": p["meta"], "sentiment": p.get("sentiment"), "ts": p.get("ts"), "url": p["url"],
+            "engagement": p.get("engagement")}
+
+
 @st.cache_data(ttl=FEED_TTL, show_spinner=False)
 def feed_posts(ticker: str) -> dict:
+    """StockTwits symbol stream, filtered to original, non-spam posts."""
     fetched = time.time()
     try:
         r = requests.get(f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json",
                          headers={"User-Agent": "Mozilla/5.0 (compatible; JD-DCF-Model/1.0)"}, timeout=HTTP_TIMEOUT)
         if r.status_code == 404:
-            return {"items": [], "error": None, "fetched_at": fetched}
+            return {"items": [], "error": None, "fetched_at": fetched, "stats": _empty_stats()}
         if r.status_code != 200:
-            return {"items": [], "error": f"HTTP {r.status_code}", "fetched_at": fetched}
-        items = []
-        for msg in (r.json().get("messages") or [])[:15]:
-            user = (msg.get("user") or {}).get("username") or "unknown"
-            sentiment = ((msg.get("entities") or {}).get("sentiment") or {}).get("basic")
-            body = (msg.get("body") or "").strip()
-            if body:
-                items.append({"source": "Posts", "ticker": ticker, "title": body[:280] + ("…" if len(body) > 280 else ""),
-                              "meta": f"@{user}", "sentiment": sentiment, "ts": _epoch(msg.get("created_at")),
-                              "url": f"https://stocktwits.com/{user}/message/{msg.get('id')}"})
-        return {"items": items, "error": None, "fetched_at": fetched}
+            return {"items": [], "error": f"HTTP {r.status_code}", "fetched_at": fetched, "stats": _empty_stats()}
+        posts = []
+        for msg in r.json().get("messages") or []:
+            try:
+                user = (msg.get("user") or {}).get("username") or "unknown"
+                body = (msg.get("body") or "").strip()
+                if not body:
+                    continue
+                likes = (msg.get("likes") or {}).get("total")
+                reshared = (msg.get("reshares") or {}).get("reshared_count")
+                posts.append({
+                    "body": body, "user": user, "meta": f"@{user}",
+                    "is_reply": bool((msg.get("conversation") or {}).get("in_reply_to_message_id")),
+                    "is_reshare": bool(msg.get("reshare_message")),
+                    "engagement": None if likes is None and reshared is None else (likes or 0) + (reshared or 0),
+                    "sentiment": ((msg.get("entities") or {}).get("sentiment") or {}).get("basic"),
+                    "ts": _epoch(msg.get("created_at")),
+                    "url": f"https://stocktwits.com/{user}/message/{msg.get('id')}",
+                })
+            except Exception:
+                continue
+        kept, stats = social_filter(posts)
+        return {"items": [_post_item(ticker, p) for p in kept], "error": None, "fetched_at": fetched, "stats": stats}
     except Exception as exc:
-        return {"items": [], "error": type(exc).__name__, "fetched_at": fetched}
+        return {"items": [], "error": type(exc).__name__, "fetched_at": fetched, "stats": _empty_stats()}
+
+
+@st.cache_data(ttl=FEED_TTL, show_spinner=False)
+def feed_x_posts(ticker: str) -> dict:
+    """X (Twitter) recent search — only when an X_BEARER_TOKEN is configured. Replies and retweets are
+    excluded in the query itself, and the same spam filters apply."""
+    fetched = time.time()
+    token = get_secret("X_BEARER_TOKEN")
+    if not token:
+        return {"items": [], "error": None, "fetched_at": fetched, "stats": None}
+    try:
+        r = requests.get("https://api.twitter.com/2/tweets/search/recent", timeout=HTTP_TIMEOUT,
+                         headers={"Authorization": f"Bearer {token}"},
+                         params={"query": f"${ticker} -is:reply -is:retweet", "max_results": 50,
+                                 "tweet.fields": "created_at,public_metrics,in_reply_to_user_id,referenced_tweets",
+                                 "expansions": "author_id", "user.fields": "username"})
+        if r.status_code != 200:
+            return {"items": [], "error": f"X HTTP {r.status_code}", "fetched_at": fetched, "stats": _empty_stats()}
+        data = r.json()
+        users = {u.get("id"): u.get("username") for u in (data.get("includes") or {}).get("users", [])}
+        posts = []
+        for t in data.get("data") or []:
+            try:
+                refs = {ref.get("type") for ref in t.get("referenced_tweets") or []}
+                pm = t.get("public_metrics") or {}
+                user = users.get(t.get("author_id")) or "unknown"
+                posts.append({
+                    "body": (t.get("text") or "").strip(), "user": user, "meta": f"@{user} on X",
+                    "is_reply": bool(t.get("in_reply_to_user_id")) or "replied_to" in refs,
+                    "is_reshare": "retweeted" in refs,
+                    "engagement": (pm.get("like_count", 0) + pm.get("retweet_count", 0) + pm.get("reply_count", 0)) if pm else None,
+                    "ts": _epoch(t.get("created_at")), "url": f"https://x.com/{user}/status/{t.get('id')}",
+                })
+            except Exception:
+                continue
+        kept, stats = social_filter([p for p in posts if p["body"]])
+        return {"items": [_post_item(ticker, p) for p in kept], "error": None, "fetched_at": fetched, "stats": stats}
+    except Exception as exc:
+        return {"items": [], "error": f"X {type(exc).__name__}", "fetched_at": fetched, "stats": _empty_stats()}
+
+
+def _merge_posts(*results: dict) -> dict:
+    """Combine social sources into one Posts result with summed filter statistics."""
+    stats, items, errors = _empty_stats(), [], []
+    for res in results:
+        items += res["items"]
+        if res.get("error"):
+            errors.append(res["error"])
+        if res.get("stats"):
+            for k in ("fetched", "replies", "reshares"):
+                stats[k] += res["stats"][k]
+            for reason, n in res["stats"]["spam"].items():
+                stats["spam"][reason] = stats["spam"].get(reason, 0) + n
+    return {"items": items, "error": "; ".join(errors) or None, "stats": stats,
+            "fetched_at": min(r["fetched_at"] for r in results)}
+
+
+def cap_posts(items: list[dict]) -> tuple[list[dict], list[dict]]:
+    """At most SOCIAL_DAILY_CAP posts per ticker per day; higher engagement wins where it is known."""
+    by_day: dict = {}
+    for it in items:
+        day = dt.datetime.fromtimestamp(it["ts"], dt.timezone.utc).date() if it.get("ts") else None
+        by_day.setdefault(day, []).append(it)
+    shown, more = [], []
+    for day_items in by_day.values():
+        ranked = sorted(day_items, key=lambda it: (-(it.get("engagement") or 0), -(it.get("ts") or 0)))
+        shown += ranked[:SOCIAL_DAILY_CAP]
+        more += ranked[SOCIAL_DAILY_CAP:]
+    newest = lambda lst: sorted(lst, key=lambda it: it.get("ts") or 0, reverse=True)
+    return newest(shown), newest(more)
 
 
 @st.cache_data(ttl=FEED_TTL, show_spinner=False)
@@ -2632,6 +2791,7 @@ def feed_filings(ticker: str) -> dict:
 def refresh_feed() -> None:
     feed_news.clear()
     feed_posts.clear()
+    feed_x_posts.clear()
     feed_filings.clear()
 
 
@@ -2683,7 +2843,8 @@ def render_feed() -> None:
 
     tickers = [h["ticker"] for h in hl]
     with st.spinner("Loading your feed…"):
-        results = {t: {"News": feed_news(t), "Posts": feed_posts(t), "Filings": feed_filings(t)} for t in tickers}
+        results = {t: {"News": feed_news(t), "Posts": _merge_posts(feed_posts(t), feed_x_posts(t)),
+                       "Filings": feed_filings(t)} for t in tickers}
     oldest = min(r["fetched_at"] for by in results.values() for r in by.values())
     c = st.columns([3, 1], vertical_alignment="center")
     c[0].caption(f"Last refreshed {dt.datetime.fromtimestamp(oldest, dt.timezone.utc).strftime('%b %d, %H:%M UTC')} "
@@ -2697,23 +2858,33 @@ def render_feed() -> None:
     sources = st.pills("Sources", ["News", "Posts", "Filings"], selection_mode="multi",
                        default=["News", "Posts", "Filings"], key="feed_sources") or []
 
-    for t in tickers if pick == "All" else [pick]:
-        counts, notes = [], []
-        for src, res in results[t].items():
-            counts.append(f"{len(res['items'])} {src.lower()}")
-            if res["error"]:
-                notes.append(f"{src} unavailable right now ({res['error']})")
-        line = f"**{t}** — " + " · ".join(counts) + (f" · {'; '.join(notes)}" if notes else "")
-        st.caption(line)
-        if not any(res["items"] for res in results[t].values()):
+    # Per ticker: news capped at NEWS_CAP, social posts capped per day (overflow under "Show more"), filings all.
+    picked = tickers if pick == "All" else [pick]
+    display, more_posts = {}, {}
+    for t in picked:
+        news = sorted(results[t]["News"]["items"], key=lambda it: it["ts"] or 0, reverse=True)
+        shown_posts, more_posts[t] = cap_posts(results[t]["Posts"]["items"])
+        display[t] = {"News": news[:NEWS_CAP], "Posts": shown_posts, "Filings": results[t]["Filings"]["items"]}
+        ps = results[t]["Posts"]["stats"]
+        spam = sum(ps["spam"].values())
+        spam_detail = ", ".join(f"{n} {why}" for why, n in ps["spam"].items())
+        notes = [f"{src} unavailable right now ({res['error']})" for src, res in results[t].items() if res["error"]]
+        st.caption(
+            f"**{t}** — {len(display[t]['News'])} news (of {len(news)}) · posts: {ps['fetched']} fetched, "
+            f"{ps['replies']} replies and {ps['reshares']} reshares removed (original posts only), {spam} spam removed"
+            + (f" ({spam_detail})" if spam else "") + f", {len(shown_posts)} shown"
+            + (f" (+{len(more_posts[t])} under Show more)" if more_posts[t] else "")
+            + f" · {len(display[t]['Filings'])} filings" + (f" · {'; '.join(notes)}" if notes else ""))
+        if not any(results[t][src]["items"] for src in results[t]):
             st.info(f"No recent news, posts or filings found for {t}. The other tickers are unaffected.")
 
     seen, items = set(), []
-    for t in tickers if pick == "All" else [pick]:
+    for t in picked:
         for src in sources:
-            for it in results[t][src]["items"]:
+            for it in display[t][src]:
                 key = it["url"].lower() if it["url"] else it["title"].strip().lower()
-                tkey = it["title"].strip().lower()
+                # Filings always show: distinct filings can share a title (e.g. several Form 4s), so use the URL only.
+                tkey = key if it["source"] == "Filings" else it["title"].strip().lower()
                 if key in seen or tkey in seen:
                     continue
                 seen.update({key, tkey})
@@ -2725,6 +2896,12 @@ def render_feed() -> None:
         st.info("Nothing to show for this filter yet.")
     else:
         st.html('<div class="feed-list">' + "".join(_feed_card(it) for it in items[:150]) + "</div>")
+    if "Posts" in sources:
+        for t in picked:
+            extra = [it for it in more_posts[t] if it["url"].lower() not in seen]
+            if extra:
+                with st.expander(f"Show {len(extra)} more {t} posts"):
+                    st.html('<div class="feed-list">' + "".join(_feed_card(it) for it in extra) + "</div>")
 
 
 # --------------------------------------------------------------------------- #
@@ -2873,4 +3050,3 @@ finally:
     except Exception:
         pass  # saving is best-effort; never break the page
     render_footer()
-    render_tabbar(st.session_state.get("view", "valuation"))
