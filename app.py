@@ -17,6 +17,7 @@ import json
 import math
 import os
 import re
+import time
 
 import pandas as pd
 import requests
@@ -88,12 +89,12 @@ def loading_html(ticker: str) -> str:
             f'<span>Loading {html.escape(ticker)}…</span></div>')
 
 
-def render_header() -> None:
+def render_header(title: str = "DCF Valuation") -> None:
     """Compact page header: gold brand line and title on the left, JD logo on the right."""
     logo = _logo_data_uri()
     logo_html = f'<img class="jd-logo" src="{logo}" alt="JD-DCF Model logo">' if logo else ""
     st.html(f'{HEADER_CSS}<div class="jd-header"><div class="jd-brand">JD-DCF MODEL</div>'
-            f'<h1 class="jd-title">DCF Valuation</h1>{logo_html}</div>')
+            f'<h1 class="jd-title">{html.escape(title)}</h1>{logo_html}</div>')
 
 CACHE_TTL = 24 * 60 * 60  # 24 hours
 FOOTER = "For education only. Not financial advice."
@@ -694,7 +695,7 @@ ASSUMPTION_CSS = """
 .st-key-assumptions {
     border: 2px solid #1d4ed8 !important;
     border-radius: 0.6rem;
-    background: rgba(29, 78, 216, 0.05);
+    background: linear-gradient(rgba(29, 78, 216, 0.05), rgba(29, 78, 216, 0.05)), var(--jd-base, transparent);
     padding: 1rem;
 }
 .st-key-assumptions [data-testid="stNumberInputContainer"],
@@ -758,7 +759,7 @@ MOBILE_CSS = """
     padding: 0.6rem 0.75rem;
     border: 1px solid rgba(128, 128, 128, 0.30);
     border-radius: 0.6rem;
-    background: rgba(128, 128, 128, 0.08);
+    background: linear-gradient(rgba(128, 128, 128, 0.08), rgba(128, 128, 128, 0.08)), var(--jd-base, transparent);
     display: flex;
     flex-direction: column;
     justify-content: center;
@@ -801,7 +802,7 @@ def desktop_legend_html() -> str:
             f'<div class="half">{"".join(items[4:])}</div></div>')
 
 
-def tile_grid(tiles: list[tuple]) -> str:
+def tile_grid(tiles: list[tuple], grid_cls: str = "") -> str:
     """HTML for a two-column tile grid. Each tile: (label, value[, css class[, delta %]])."""
     cells = []
     for label, value, *rest in tiles:
@@ -813,7 +814,7 @@ def tile_grid(tiles: list[tuple]) -> str:
                           f'{html.escape(fmt_pct(delta, signed=True))} vs current</span>')
         cells.append(f'<div class="tile {cls}"><span class="lbl">{html.escape(label)}</span>'
                      f'<span class="val">{html.escape(value)}</span>{delta_html}</div>')
-    return f'<div class="tile-grid">{"".join(cells)}</div>'
+    return f'<div class="tile-grid {grid_cls}">{"".join(cells)}</div>'
 
 
 def fade(start: float, n: int) -> list[float]:
@@ -982,7 +983,8 @@ def bound(key: str) -> dict:
 
 
 # Inputs that are saved per ticker; older saved names (e.g. a removed method radio) are dropped.
-SAVED_INPUTS = {*(f"g{i}" for i in range(5)), *(f"m{i}" for i in range(5)), "conv", "wacc", "terminal",
+SAVED_INPUTS = {*(f"g{i}" for i in range(5)), *(f"m{i}" for i in range(5)), *(f"s{i}" for i in range(5)),
+                "sbc_method", "conv", "wacc", "terminal",
                 "pe_mult", "ps_mult", "ev_mult", "pfcf_mult"}
 
 
@@ -1028,6 +1030,8 @@ def persist_inputs(ticker: str | None, slot) -> None:
                     _same(v, saved["values"][n]) for n, v in values.items()):
                 saved_at = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
                 writes[item] = json.dumps({"saved_at": saved_at, "values": values})
+    if items is not None:
+        writes.update(global_writes(items))
     with slot:
         _browser_store(writes=writes, key=STORE_KEY, default=None)
 
@@ -1236,8 +1240,10 @@ def render_snapshot(m: dict, fcf_for_yield: float | None, price) -> None:
     st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable.")
 
 
-def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> tuple[list[dict], list] | None:
-    """Assumption boxes, calculated table and bar chart. Returns (projected years, projected EPS)."""
+def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_rows: list[dict],
+                 market_cap) -> tuple[list[dict], list, list | None] | None:
+    """Assumption boxes, SBC projection, calculated table and bar chart.
+    Returns (projected years, projected EPS, projected SBC $ per year or None)."""
     st.header("Financial Model")
     if not pos(base["revenue"]):
         st.warning("Base-year revenue is unavailable, so the projection model and DCF cannot be built.")
@@ -1259,25 +1265,33 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> t
 
     st.markdown(ASSUMPTION_CSS, unsafe_allow_html=True)
     with st.container(border=True, key="assumptions"):
-        st.subheader("Projection Assumptions — edit any box to run your own case")
+        top = st.columns([3, 1], vertical_alignment="center")
+        top[0].subheader("Projection Assumptions — edit any box to run your own case")
+        top[1].button("Reset to consensus" if defaults["is_consensus"] else "Reset to defaults",
+                      on_click=reset_inputs, args=(ticker,), width="stretch",
+                      help="Restores every input for this ticker to its default and deletes your saved inputs.")
         restored = st.session_state.get(f"_restored_{ticker}")
         if restored is not None:
             st.caption(f"💾 Restored your saved assumptions for this ticker (saved {fmt_saved_at(restored)}).")
-        widths = [1.6] + [1] * YEARS
+        # Year boxes sit in a grid: 5 across on desktop; CSS wraps them 3 + 2 on phones.
         for label, kind, help_text in (
             ("Revenue growth %", "g", "Projected revenue = prior-year revenue × (1 + growth %)."),
             ("Adj. EBITDA margin %", "m",
              "Projected Adjusted EBITDA = projected revenue × Adjusted EBITDA margin %."),
         ):
-            cols = st.columns(widths, vertical_alignment="bottom")
-            cols[0].markdown(f"**{label}**", help=help_text)
-            for i, col in enumerate(cols[1:]):
-                col.number_input(f"{years[i]}E", step=0.5, format="%.1f", **bound(input_key(ticker, f"{kind}{i}")))
-        cols = st.columns([1.6, 1, 4], vertical_alignment="bottom")
-        cols[0].markdown("**FCF conversion %**",
-                         help="FCF ÷ Adjusted EBITDA. Projected FCF = projected Adjusted EBITDA × conversion %.")
-        cols[1].number_input("All years", step=1.0, format="%.1f", **bound(input_key(ticker, "conv")))
-        cols[2].caption(md_escape(base["conv_calc"]))
+            with st.container(key=f"row_{kind}"):  # label left of the grid on desktop, above it on phones
+                st.markdown(f"**{label}**", help=help_text)
+                with st.container(key=f"grid_{kind}"):
+                    for i, col in enumerate(st.columns(YEARS)):
+                        col.number_input(f"{years[i]}E", step=0.5, format="%.1f",
+                                         **bound(input_key(ticker, f"{kind}{i}")))
+        with st.container(key="conv_row"):
+            cols = st.columns([1.6, 1, 3], vertical_alignment="center")
+            cols[0].markdown("**FCF conversion %**",
+                             help="FCF ÷ Adjusted EBITDA. Projected FCF = projected Adjusted EBITDA × conversion %.")
+            cols[1].number_input("FCF conversion % (all years)", step=1.0, format="%.1f", label_visibility="collapsed",
+                                 **bound(input_key(ticker, "conv")))
+        st.caption(md_escape(base["conv_calc"]))
         conv_now = st.session_state[input_key(ticker, "conv")]
         if base["conv_unusual"]:
             st.warning(f"⚠️ The company's actual conversion is {base['conversion']:.1f}%, which is unusually "
@@ -1286,19 +1300,16 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> t
         if conv_now > 100 and not _same(conv_now, defaults["conversion"]):
             st.warning("FCF conversion above 100% means free cash flow exceeds Adjusted EBITDA every year. That can "
                        "happen briefly (e.g. working-capital releases) but is not sustainable long-term.")
-        cols = st.columns([3, 1], vertical_alignment="center")
         save_note = (" Your changes save automatically in this browser." if storage_available()
                      else " Browser storage is unavailable, so changes will not be saved.")
-        cols[0].caption(defaults["caption"] + save_note)
-        cols[1].button("Reset to consensus" if defaults["is_consensus"] else "Reset to defaults",
-                       on_click=reset_inputs, args=(ticker,), width="stretch",
-                       help="Restores every input for this ticker to its default and deletes your saved inputs.")
+        st.caption(defaults["caption"] + save_note)
 
     growth = [st.session_state[input_key(ticker, f"g{i}")] for i in range(YEARS)]
     margin = [st.session_state[input_key(ticker, f"m{i}")] for i in range(YEARS)]
     conversion = st.session_state[input_key(ticker, "conv")]
     proj = project(base["revenue"], growth, margin, conversion)
     eps = project_eps(base["eps"], base["ebitda"], proj, defaults["eps"])
+    sbc = render_sbc(ticker, base, years, proj, sbc_rows, market_cap)
 
     labels = [f"{base['label']} Actual"] + [f"{y}E" for y in years]
     chart_labels = [f"{base['label']}<br>Actual"] + labels[1:]  # two-line label keeps ticks horizontal
@@ -1313,6 +1324,11 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> t
         },
         index=labels,
     ).T
+    if sbc:
+        base_sbc = sbc_rows[-1]["sbc"] if sbc_rows and sbc_rows[-1]["end"] == base["end"] else None
+        table.loc["Stock-Based Compensation"] = [fmt_money(base_sbc)] + [fmt_money(v) for v in sbc]
+        base_after = base["fcf"] - base_sbc if base["fcf"] is not None and base_sbc is not None else None
+        table.loc["FCF after SBC"] = [fmt_money(base_after)] + [fmt_money(p["fcf"] - v) for p, v in zip(proj, sbc)]
     st.dataframe(table, width="stretch")
     st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. "
                f"Actual FCF = operating cash flow − capex. Actual Adjusted EBITDA: {base['ebitda_source']}. "
@@ -1332,7 +1348,7 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int]) -> t
     except ImportError:
         st.warning("Install plotly (`pip install plotly`) to see the chart.")
     st.caption(eps_caption(defaults, years, eps, base))
-    return proj, eps
+    return proj, eps, sbc
 
 
 def ntm_figures(base_end: pd.Timestamp, years: list[int], proj: list[dict], eps: list,
@@ -1386,7 +1402,8 @@ def eps_caption(defaults: dict, years: list[int], eps: list, base: dict) -> str:
     return "".join(parts)
 
 
-def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt, shares, price) -> float | None:
+def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt, shares, price,
+               sbc: list | None = None) -> float | None:
     """Render the DCF section. Returns the implied price."""
     st.header("Discounted Cash Flow")
     c1, c2 = st.columns(2)
@@ -1453,6 +1470,8 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
                 "to the terminal growth and WACC assumptions.")
     if implied <= 0:
         st.warning("Net debt exceeds the DCF enterprise value, so the implied equity value is negative.")
+    if sbc:
+        render_sbc_dcf(proj, sbc, terminal, wacc, net_debt, shares, implied, price)
 
     return implied if implied > 0 else None
 
@@ -1537,7 +1556,7 @@ def render_summary(dcf_price: float | None, multiples: list[tuple], price) -> No
     """Three blocks: intrinsic value today, the 12-month multiples target, and a mixed-horizon blend."""
     st.header("Summary")
     left, right = st.columns(2)
-    with left.container(border=True):
+    with left.container(border=True, key="sum_dcf"):
         st.markdown("**Intrinsic Value (DCF) — value today**")
         if dcf_price:
             up = upside(dcf_price, price)
@@ -1546,7 +1565,7 @@ def render_summary(dcf_price: float | None, multiples: list[tuple], price) -> No
         else:
             st.metric("DCF implied price", "N/A")
             st.caption("No DCF value: it is hidden for banks/insurers or not meaningful for this company's cash flows.")
-    with right.container(border=True):
+    with right.container(border=True, key="sum_ntm"):
         if len(multiples) >= 2:
             names = ", ".join(n for n, _ in multiples)
             target = sum(p for _, p in multiples) / len(multiples)
@@ -1647,6 +1666,15 @@ def render_how_it_works() -> None:
                  r"P/S = \frac{\text{Mkt Cap}}{\text{Revenue}} \quad P/B = \frac{Price}{\text{Book/Share}}")
         st.latex(r"EV = \text{Mkt Cap} + \text{Debt} - \text{Cash} \quad EV/Sales \quad EV/EBITDA \quad "
                  r"\text{FCF Yield} = \frac{FCF}{\text{Mkt Cap}}")
+        st.markdown("**Stock-based compensation.** SBC history comes from SEC EDGAR (ShareBasedCompensation), "
+                    "else the provider's cash-flow statement. Projected SBC = projected revenue × SBC % (Trend, Flat "
+                    "or Dollar-growth defaults, all editable). FCF after SBC = FCF − SBC; the DCF (after SBC) "
+                    "discounts it with the same WACC, terminal growth, net debt and share count, and the share "
+                    "count is not grown for SBC so the cost is not counted twice. SBC drag = standard DCF − "
+                    "DCF (after SBC), per share.")
+        st.markdown("**Compounding calculator** (i = annual return ÷ 12, n = months, contributions at month end)")
+        st.latex(r"B_{m} = B_{m-1}(1+i) + PMT \qquad \text{Goal: } PMT = \frac{(\text{Target} - "
+                 r"\text{Start}(1+i)^n)\, i}{(1+i)^n - 1}")
         st.markdown("Total debt is approximate: long-term debt (including current portion) plus short-term "
                     "borrowings/commercial paper; cash excludes marketable securities.")
 
@@ -1756,8 +1784,10 @@ def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
 
 
 def main() -> str | None:
-    """Render the app. Returns the ticker whose inputs should be saved, if any."""
-    render_header()
+    """Route to the active view. Returns the ticker whose inputs should be saved, if any."""
+    view = st.session_state.get("view", "valuation")
+    st.html(app_css())  # texture, tab bar, compact grids; style-only HTML takes no layout space
+    render_header(VIEW_TITLES[view])
 
     # Saved inputs live in the browser, which reports them a moment after the
     # first run. Wait for them so widgets start from saved values, not defaults.
@@ -1766,6 +1796,20 @@ def main() -> str | None:
         st.info("Loading your saved inputs…")
         st.button("Continue without saved inputs", on_click=st.session_state.update, kwargs={"_store_skip": True})
         return None
+    if view == "compounding":
+        render_compounding()
+        return None
+    if view == "feed":
+        render_feed()
+        return None
+    if view == "portfolio":
+        render_portfolio()
+        return None
+    return valuation_view(items)
+
+
+def valuation_view(items: dict | None) -> str | None:
+    """The DCF valuation view (the original app)."""
     if "ticker_query" not in st.session_state:
         st.session_state["ticker_query"] = (items or {}).get(LAST_TICKER_ITEM) or "AAPL"
 
@@ -1892,8 +1936,8 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     # ---- 3. Projection model (1 actual year + 5 projected years)
     years = [base["end"].year + i for i in range(1, YEARS + 1)]
     defaults = build_defaults(base, years, m.get("estimates"), yf_est)
-    model = render_model(ticker, base, defaults, years)
-    proj, eps = model if model else (None, None)
+    model = render_model(ticker, base, defaults, years, sbc_history(history, m), m["market_cap"])
+    proj, eps, sbc = model if model else (None, None, None)
 
     # ---- 4. DCF
     dcf_price = None
@@ -1902,7 +1946,7 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
         show_dcf = st.checkbox("Show DCF anyway (not recommended for banks/insurers)", value=False,
                                key=f"force_dcf_{ticker}")
     if show_dcf:
-        dcf_price = render_dcf(ticker, proj, years, net_debt, shares, price)
+        dcf_price = render_dcf(ticker, proj, years, net_debt, shares, price, sbc)
     else:
         st.header("Discounted Cash Flow")
         st.info("DCF hidden for this financial company — see the warning above.")
@@ -1916,15 +1960,917 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     return ticker
 
 
+# --------------------------------------------------------------------------- #
+# App shell: views, bottom tab bar, gold-textured background
+# --------------------------------------------------------------------------- #
+VIEWS = (("valuation", "📊 Valuation"), ("compounding", "🧮 Compounding"),
+         ("feed", "📰 My Feed"), ("portfolio", "💼 Portfolio"))
+VIEW_TITLES = {"valuation": "DCF Valuation", "compounding": "Compounding Calculator",
+               "feed": "My Daily Feed", "portfolio": "My Portfolio"}
+NAVY = "#10204a"   # the logo's background
+GOLD = "#b38b22"
+_RUN: dict = {}    # per-run flags (the script re-executes on every rerun, so this starts empty)
+
+APP_CSS = f"""
+/* Toolbar: mostly opaque so scrolled content never sits under it, while the gold glow still shows below. */
+[data-testid="stHeader"] {{ background: color-mix(in srgb, var(--jd-base) 97%, transparent) !important;
+    backdrop-filter: blur(6px); }}
+@media (min-width: 768px) {{
+    .st-key-row_g, .st-key-row_m {{ flex-direction: row !important; align-items: flex-end !important; flex-wrap: nowrap !important; }}
+    .st-key-row_g > div:first-child, .st-key-row_m > div:first-child {{ flex: 0 0 14% !important; width: 14% !important;
+        padding-bottom: 0.55rem; }}
+    .st-key-row_g > div:last-child, .st-key-row_m > div:last-child {{ flex: 1 1 auto !important; min-width: 0 !important; width: auto !important; }}
+}}
+[data-testid="stMainBlockContainer"] {{ padding-bottom: calc(120px + env(safe-area-inset-bottom, 0px)) !important; }}
+/* Content surfaces stay solid over the texture. */
+[data-testid="stExpander"] details, [data-testid="stPlotlyChart"], .st-key-sbc_proj, .st-key-sbc_dcf,
+.st-key-sum_dcf, .st-key-sum_ntm, .st-key-pf_rows, .feed-card {{ background-color: var(--jd-base); }}
+
+/* Bottom tab bar */
+.st-key-tabbar {{
+    position: fixed !important; left: 50%; transform: translateX(-50%); bottom: 0; z-index: 999990;
+    width: min(640px, 100%); box-sizing: border-box; gap: 0 !important;
+    background: {NAVY}; border-top: 1px solid rgba(179, 139, 34, 0.55); border-radius: 14px 14px 0 0;
+    padding: 6px 8px calc(6px + env(safe-area-inset-bottom, 0px)) 8px !important;
+    box-shadow: 0 -4px 18px rgba(0, 0, 0, 0.25);
+}}
+.st-key-tabbar [data-testid="stHorizontalBlock"] {{ flex-wrap: nowrap !important; flex-direction: row !important; gap: 4px !important; }}
+.st-key-tabbar [data-testid="stColumn"] {{ min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }}
+.st-key-tabbar button {{
+    background: transparent !important; border: 0 !important; color: #ffffff !important;
+    min-height: 46px; padding: 4px 2px !important; border-radius: 10px !important; box-shadow: none !important;
+}}
+.st-key-tabbar button p {{ font-size: 0.82rem; font-weight: 600; line-height: 1.15; white-space: normal; color: inherit; }}
+.st-key-tabbar button[data-testid="stBaseButton-primary"] {{ background: {GOLD} !important; color: {NAVY} !important; }}
+
+/* Compact year grids (Projection Assumptions, SBC %) */
+@media (max-width: 767px) {{
+    .st-key-tabbar {{ width: 100%; border-radius: 0; padding-left: 4px !important; padding-right: 4px !important; }}
+    .st-key-tabbar button p {{ font-size: 0.72rem; }}
+    .st-key-grid_g [data-testid="stHorizontalBlock"], .st-key-grid_m [data-testid="stHorizontalBlock"],
+    .st-key-grid_s [data-testid="stHorizontalBlock"] {{
+        flex-wrap: wrap !important; flex-direction: row !important; gap: 0.5rem !important; }}
+    .st-key-grid_g [data-testid="stColumn"], .st-key-grid_m [data-testid="stColumn"],
+    .st-key-grid_s [data-testid="stColumn"] {{
+        flex: 0 0 calc((100% - 1rem) / 3) !important; width: calc((100% - 1rem) / 3) !important; min-width: 0 !important; }}
+    .st-key-grid_g [data-testid="stNumberInputStepDown"], .st-key-grid_g [data-testid="stNumberInputStepUp"],
+    .st-key-grid_m [data-testid="stNumberInputStepDown"], .st-key-grid_m [data-testid="stNumberInputStepUp"],
+    .st-key-grid_s [data-testid="stNumberInputStepDown"], .st-key-grid_s [data-testid="stNumberInputStepUp"],
+    .st-key-conv_row [data-testid="stNumberInputStepDown"], .st-key-conv_row [data-testid="stNumberInputStepUp"],
+    .st-key-pf_rows [data-testid="stNumberInputStepDown"], .st-key-pf_rows [data-testid="stNumberInputStepUp"] {{
+        display: none !important; }}
+    .st-key-conv_row [data-testid="stHorizontalBlock"], .st-key-pf_rows [data-testid="stHorizontalBlock"] {{
+        flex-wrap: nowrap !important; flex-direction: row !important; gap: 0.5rem !important; }}
+    .st-key-conv_row [data-testid="stColumn"], .st-key-pf_rows [data-testid="stColumn"] {{
+        min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }}
+    .st-key-conv_row [data-testid="stColumn"]:last-child {{ display: none !important; }}
+}}
+
+/* Four-across tiles on desktop (two on phones) */
+.tile-grid.cols4 {{ grid-template-columns: repeat(4, minmax(0, 1fr)); }}
+@media (max-width: 767px) {{ .tile-grid.cols4 {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }} }}
+.big-figure {{ font-size: 2.6rem; font-weight: 700; line-height: 1.1; font-variant-numeric: tabular-nums; }}
+.big-label {{ font-size: 0.85rem; opacity: 0.75; }}
+
+/* Feed */
+.feed-list {{ display: flex; flex-direction: column; gap: 0.6rem; }}
+.feed-card {{ border: 1px solid rgba(128, 128, 128, 0.28); border-radius: 0.6rem; padding: 0.7rem 0.85rem; }}
+.feed-meta {{ display: flex; flex-wrap: wrap; gap: 0.45rem; align-items: center; font-size: 0.78rem; }}
+.feed-meta .muted {{ opacity: 0.72; }}
+.feed-badge {{ font-weight: 700; font-size: 0.68rem; letter-spacing: 0.04em; padding: 0.1rem 0.45rem; border-radius: 999px; color: #fff; }}
+.feed-badge.news {{ background: #1d4ed8; }}
+.feed-badge.posts {{ background: #7c3aed; }}
+.feed-badge.filings {{ background: {GOLD}; }}
+.feed-title {{ margin-top: 0.3rem; font-size: 0.95rem; line-height: 1.35; overflow-wrap: anywhere; }}
+.feed-title a {{ color: inherit; text-decoration: none; }}
+.feed-title a:hover {{ text-decoration: underline; }}
+.feed-sent.bull {{ color: #16a34a; font-weight: 600; }}
+.feed-sent.bear {{ color: #dc2626; font-weight: 600; }}
+"""
+
+
+def _texture_rules(dark: bool) -> str:
+    """Warm base colour, a faint 26px gold dot grid, and a soft gold glow behind the header."""
+    base = "#16120d" if dark else "#fcfaf5"
+    dot = "rgba(179, 139, 34, 0.10)" if dark else "rgba(179, 139, 34, 0.16)"
+    glow = "rgba(179, 139, 34, 0.12)" if dark else "rgba(214, 178, 94, 0.18)"
+    return (f":root {{ --jd-base: {base}; }}"
+            f".stApp {{ background-color: {base} !important; }}"
+            f'[data-testid="stMain"] {{ background-color: transparent;'
+            f" background-image: radial-gradient(ellipse 75% 400px at 50% 0, {glow}, transparent 100%),"
+            f" radial-gradient(circle at 13px 13px, {dot} 0.8px, transparent 1.3px);"
+            f" background-size: 100% 400px, 26px 26px; background-repeat: no-repeat, repeat;"
+            f" background-attachment: local, local; }}")
+
+
+def app_css() -> str:
+    """Global CSS. Uses Streamlit's active theme when known, else the system colour scheme."""
+    try:
+        kind = st.context.theme.type
+    except Exception:
+        kind = None
+    if kind in ("light", "dark"):
+        texture = _texture_rules(kind == "dark")
+    else:
+        texture = _texture_rules(False) + "@media (prefers-color-scheme: dark) {" + _texture_rules(True) + "}"
+    return MOBILE_CSS + "<style>" + texture + APP_CSS + "</style>"
+
+
+def set_view(view: str) -> None:
+    st.session_state["view"] = view
+
+
+def render_tabbar(active: str) -> None:
+    """Fixed bottom navigation (positioned by CSS, so its place in the page does not matter)."""
+    with st.container(key="tabbar"):
+        for col, (view, label) in zip(st.columns(len(VIEWS)), VIEWS):
+            col.button(label, key=f"tab_{view}", type="primary" if view == active else "secondary",
+                       on_click=set_view, args=(view,), width="stretch")
+
+
+# --------------------------------------------------------------------------- #
+# Browser-wide saved items: calculator inputs and holdings
+# --------------------------------------------------------------------------- #
+CALC_ITEM = "dcf_calc"
+HOLDINGS_ITEM = "dcf_holdings"
+CALC_DEFAULTS = {"calc_mode": "Calculator", "calc_start": 1000.0, "calc_monthly": 200.0, "calc_return": 8.0,
+                 "calc_years": 20, "calc_increase": 0.0, "goal_target": 100000.0, "goal_years": 10,
+                 "goal_start": 1000.0, "goal_return": 8.0}
+CALC_MODES = ["Calculator", "Goal solver"]
+DEFAULT_HOLDINGS = [{"ticker": "ZETA", "shares": None, "cost": None}]
+TICKER_RE = re.compile(r"^[A-Z][A-Z0-9\-]{0,9}$")
+PRIVACY_NOTE = ("🔒 Your holdings are stored only in this browser (local storage). The app uses them to build "
+                "this page but never saves them on a server.")
+
+
+def stored_json(item: str, default):
+    raw = (stored_items() or {}).get(item)
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except ValueError:
+        return default
+
+
+def seed_calc(name: str) -> str:
+    """Seed a calculator input from the browser's saved values (or its default) before its widget exists."""
+    if name not in st.session_state:
+        default = CALC_DEFAULTS[name]
+        saved = stored_json(CALC_ITEM, {})
+        value = saved.get(name, default) if isinstance(saved, dict) else default
+        if isinstance(default, str):
+            value = value if value in CALC_MODES else default
+        elif isinstance(default, int):
+            value = int(value) if num(value) is not None else default
+        else:
+            value = float(value) if num(value) is not None else default
+        st.session_state[name] = value
+    return name
+
+
+def _normalize_holdings(entries) -> list[dict]:
+    out, seen = [], set()
+    for h in entries if isinstance(entries, list) else []:
+        if not isinstance(h, dict):
+            continue
+        t = str(h.get("ticker", "")).strip().upper().replace(".", "-")
+        if not TICKER_RE.match(t) or t in seen:
+            continue
+        shares, cost = num(h.get("shares")), num(h.get("cost"))
+        out.append({"ticker": t, "shares": shares if shares is not None and shares >= 0 else None,
+                    "cost": cost if cost is not None and cost >= 0 else None})
+        seen.add(t)
+    return out
+
+
+def holdings() -> list[dict]:
+    """The shared holdings list (Feed + Portfolio), loaded once per session from browser storage."""
+    if "holdings" not in st.session_state:
+        st.session_state["holdings"] = _normalize_holdings(stored_json(HOLDINGS_ITEM, None) or
+                                                           [dict(h) for h in DEFAULT_HOLDINGS])
+    return st.session_state["holdings"]
+
+
+def add_holding(ticker: str, shares=None, cost=None) -> str | None:
+    """Add (or update) a holding. Returns an error message, or None on success."""
+    t = (ticker or "").strip().upper().replace(".", "-")
+    if not TICKER_RE.match(t):
+        return f"“{ticker}” doesn't look like a ticker symbol."
+    hl = holdings()
+    for h in hl:
+        if h["ticker"] == t:
+            if shares is not None:
+                h["shares"] = shares
+                st.session_state.pop(f"pf_sh_{t}", None)
+            if cost is not None:
+                h["cost"] = cost
+                st.session_state.pop(f"pf_cost_{t}", None)
+            return None
+    hl.append({"ticker": t, "shares": shares, "cost": cost})
+    return None
+
+
+def remove_holding(ticker: str) -> None:
+    st.session_state["holdings"] = [h for h in holdings() if h["ticker"] != ticker]
+    for k in (f"pf_sh_{ticker}", f"pf_cost_{ticker}"):
+        st.session_state.pop(k, None)
+
+
+def global_writes(items: dict) -> dict:
+    """Browser-storage writes for the calculator inputs and the holdings list (only when changed)."""
+    writes: dict = {}
+    if _RUN.get("calc"):
+        saved = stored_json(CALC_ITEM, {})
+        saved = saved if isinstance(saved, dict) else {}
+        values = {k: st.session_state.get(k, saved.get(k, d)) for k, d in CALC_DEFAULTS.items()}
+        if all(_same(values[k], d) for k, d in CALC_DEFAULTS.items()):
+            if CALC_ITEM in items:
+                writes[CALC_ITEM] = None
+        elif set(saved) != set(values) or not all(_same(values[k], saved[k]) for k in values):
+            writes[CALC_ITEM] = json.dumps(values)
+    if "holdings" in st.session_state:
+        current = st.session_state["holdings"]
+        stored = stored_json(HOLDINGS_ITEM, None)
+        if stored is None:
+            if current != DEFAULT_HOLDINGS:
+                writes[HOLDINGS_ITEM] = json.dumps(current)
+        elif _normalize_holdings(stored) != current:
+            writes[HOLDINGS_ITEM] = json.dumps(current)
+    return writes
+
+
+# --------------------------------------------------------------------------- #
+# Stock-based compensation (SBC): history, projection methods, backtest
+# --------------------------------------------------------------------------- #
+SBC_METHODS = ["Trend", "Flat", "Dollar growth"]
+SBC_RECENCY = {0: 3.0, 1: 2.0, 2: 1.5}  # weight by age (0 = latest year); older years 0.5
+
+
+def sbc_history(history: pd.DataFrame, m: dict) -> list[dict]:
+    """Up to 5 fiscal years of SBC and revenue: EDGAR ShareBasedCompensation, else the provider cash-flow line."""
+    rows = []
+    for label, row in history.iterrows():
+        end, rev = pd.Timestamp(row["Period End"]), num(row.get("Revenue"))
+        sbc, source = num(row.get("Stock-Based Compensation")), "SEC EDGAR"
+        if sbc is None:
+            for a in m.get("annual") or []:
+                try:
+                    near = abs((pd.Timestamp(a["date"]) - end).days) <= 21
+                except (KeyError, ValueError):
+                    continue
+                if near and a.get("sbc") is not None:
+                    sbc, source = num(a["sbc"]), f"{a['source']} cash-flow statement"
+                    break
+        if pos(rev) and sbc is not None and sbc >= 0:
+            rows.append({"label": label, "end": end, "sbc": sbc, "revenue": rev, "pct": sbc / rev * 100,
+                         "source": source})
+    for i, r in enumerate(rows):
+        r["yoy"] = (r["sbc"] / rows[i - 1]["sbc"] - 1) * 100 if i and rows[i - 1]["sbc"] > 0 else None
+    return rows
+
+
+def _median(values: list[float]) -> float:
+    s = sorted(values)
+    n = len(s)
+    return s[n // 2] if n % 2 else (s[n // 2 - 1] + s[n // 2]) / 2
+
+
+def sbc_weights(rows: list[dict]) -> tuple[list[float], int | None]:
+    """Recency weights (latest 3 years 3 / 2 / 1.5, older 0.5) with at most one outlier year halved.
+
+    Outlier rule (needs 4+ years): the year whose SBC % of revenue deviates most from the median of the
+    other years is flagged if that deviation exceeds 10 percentage points."""
+    n = len(rows)
+    w = [SBC_RECENCY.get(n - 1 - i, 0.5) for i in range(n)]
+    outlier = None
+    if n >= 4:
+        devs = [abs(r["pct"] - _median([o["pct"] for j, o in enumerate(rows) if j != i])) for i, r in enumerate(rows)]
+        i = max(range(n), key=lambda k: devs[k])
+        if devs[i] > 10:
+            outlier, w[i] = i, w[i] * 0.5
+    return w, outlier
+
+
+def sbc_slope(rows: list[dict], w: list[float]) -> float:
+    """Weighted least-squares slope of SBC % of revenue, in percentage points per year."""
+    if len(rows) < 2:
+        return 0.0
+    xs, ys, sw = range(len(rows)), [r["pct"] for r in rows], sum(w)
+    xm = sum(wi * x for wi, x in zip(w, xs)) / sw
+    ym = sum(wi * y for wi, y in zip(w, ys)) / sw
+    sxx = sum(wi * (x - xm) ** 2 for wi, x in zip(w, xs))
+    sxy = sum(wi * (x - xm) * (y - ym) for wi, x, y in zip(w, xs, ys))
+    return sxy / sxx if sxx else 0.0
+
+
+def sbc_trend(rows: list[dict], steps: int = YEARS) -> tuple[list[float], float]:
+    """Trend: start at the latest actual %, move by the weighted slope with its effect halving each year,
+    a one-year change capped at 20% of the prior year's %, and never below 0."""
+    slope = sbc_slope(rows, sbc_weights(rows)[0])
+    p, out = rows[-1]["pct"], []
+    for k in range(steps):
+        change = min(max(slope * 0.5 ** k, -0.2 * p), max(1.0, 0.2 * p))
+        p = max(0.0, p + change)
+        out.append(p)
+    return out, slope
+
+
+def sbc_flat(rows: list[dict], steps: int = YEARS) -> list[float]:
+    w, _ = sbc_weights(rows)
+    return [sum(wi * r["pct"] for wi, r in zip(w, rows)) / sum(w)] * steps
+
+
+def sbc_dollar(rows: list[dict], base_revenue: float, proj: list[dict]) -> tuple[list[float] | None, float | None]:
+    """Dollar growth: SBC dollar CAGR (outlier excluded) dampened to 80%, capped at each year's revenue growth."""
+    _, outlier = sbc_weights(rows)
+    usable = [r for i, r in enumerate(rows) if i != outlier and r["sbc"] > 0]
+    if len(usable) < 2:
+        return None, None
+    years = (usable[-1]["end"] - usable[0]["end"]).days / 365.25
+    if years <= 0:
+        return None, None
+    cagr = (usable[-1]["sbc"] / usable[0]["sbc"]) ** (1 / years) - 1
+    sbc, prev, out = rows[-1]["sbc"], base_revenue, []
+    for p in proj:
+        sbc *= 1 + min(0.8 * cagr, p["revenue"] / prev - 1)
+        out.append(max(0.0, sbc / p["revenue"] * 100))
+        prev = p["revenue"]
+    return out, cagr
+
+
+def sbc_backtest(rows: list[dict]) -> dict | None:
+    """Project the latest year's SBC % with Trend, using only data through two fiscal years earlier."""
+    if len(rows) < 4:
+        return None
+    sub = rows[:-2]
+    predicted = sbc_trend(sub, steps=2)[0][1]
+    actual = rows[-1]["pct"]
+    return {"first": sub[0]["label"], "through": sub[-1]["label"], "target": rows[-1]["label"],
+            "predicted": predicted, "actual": actual,
+            "error": (predicted - actual) / actual * 100 if actual else None}
+
+
+def apply_sbc_method(ticker: str, values: dict) -> None:
+    """Method picker callback: fill the five SBC % boxes with the chosen method's projection."""
+    method = st.session_state[input_key(ticker, "sbc_method")]
+    for i, v in enumerate(values[method]):
+        st.session_state[input_key(ticker, f"s{i}")] = v
+
+
+def render_sbc(ticker: str, base: dict, years: list[int], proj: list[dict], rows: list[dict],
+               market_cap) -> list[float] | None:
+    """SBC projection boxes and the history/basis panel. Returns projected SBC $ per year, or None."""
+    st.subheader("Stock-Based Compensation (SBC)")
+    if not rows:
+        with st.expander("SBC History & Projection Basis"):
+            st.info("No usable stock-based compensation history was found for this company (SEC EDGAR and the "
+                    "provider's cash-flow statement report none). The SBC rows and the after-SBC DCF are skipped.")
+        return None
+
+    trend, slope = sbc_trend(rows)
+    flat = sbc_flat(rows)
+    dollar, cagr = sbc_dollar(rows, base["revenue"], proj)
+    methods = {"Trend": trend, "Flat": flat, "Dollar growth": dollar or flat}
+    rounded = {k: [round(v, 1) for v in vals] for k, vals in methods.items()}
+    for i in range(YEARS):
+        seed_input(ticker, f"s{i}", rounded["Trend"][i], lo=0.0)
+    method_key = seed_input(ticker, "sbc_method", "Trend", options=SBC_METHODS)
+
+    with st.container(border=True, key="sbc_proj"):
+        st.markdown("**SBC % of revenue — projection**",
+                    help="Projected SBC $ = projected revenue × SBC %. Pick a method to refill the boxes, or edit them.")
+        st.radio("Projection method", SBC_METHODS, horizontal=True, key=method_key,
+                 index=SBC_METHODS.index(st.session_state[method_key]),
+                 on_change=apply_sbc_method, args=(ticker, rounded))
+        with st.container(key="grid_s"):
+            for i, col in enumerate(st.columns(YEARS)):
+                col.number_input(f"{years[i]}E", min_value=0.0, step=0.5, format="%.1f",
+                                 **bound(input_key(ticker, f"s{i}")))
+        pcts = [st.session_state[input_key(ticker, f"s{i}")] for i in range(YEARS)]
+        sbc = [p["revenue"] * pct / 100 for p, pct in zip(proj, pcts)]
+        total = sum(sbc)
+        share = safe_div(total, market_cap)
+        st.caption(md_escape(
+            f"Projected SBC {years[0]}–{years[-1]}: {fmt_money(total)} in total"
+            + (f" — {share:.1%} of today's market cap ({fmt_money(market_cap)}), the approximate shareholder "
+               "dilution cost." if share is not None else ".")))
+
+    with st.expander("SBC History & Projection Basis"):
+        w, outlier = sbc_weights(rows)
+        st.dataframe(pd.DataFrame([{
+            "Year": r["label"], "SBC": fmt_money(r["sbc"]), "Revenue": fmt_money(r["revenue"]),
+            "SBC % of revenue": f"{r['pct']:.1f}%",
+            "YoY SBC growth": fmt_pct(r["yoy"] / 100, signed=True) if r["yoy"] is not None else "—",
+            "Weight": f"{wi:.2f}" + (" (outlier, halved)" if i == outlier else ""), "Source": r["source"],
+        } for i, (r, wi) in enumerate(zip(rows, w))]).set_index("Year"), width="stretch")
+        if outlier is not None:
+            r = rows[outlier]
+            others = _median([o["pct"] for j, o in enumerate(rows) if j != outlier])
+            st.warning(f"Outlier: {r['label']} SBC was {r['pct']:.1f}% of revenue, {abs(r['pct'] - others):.1f} "
+                       f"percentage points from the median of the other years ({others:.1f}%). Its weight is halved "
+                       "in the Trend and Flat calculations, and it is not used as the starting year of the "
+                       "Dollar-growth CAGR.")
+        elif len(rows) >= 4:
+            st.caption("No outlier: no year's SBC % of revenue is more than 10 percentage points from the median "
+                       "of the other years.")
+        else:
+            st.caption("Fewer than 4 years of history, so the outlier rule is not applied.")
+        if rows[-1]["end"] != base["end"]:
+            st.caption(f"Latest SBC year is {rows[-1]['label']}, earlier than the model's base year {base['label']}.")
+        fmt_list = lambda vals: ", ".join(f"{v:.1f}%" for v in vals)
+        st.markdown(md_escape(
+            f"- **Trend (default):** recency-weighted slope {slope:+.1f} pp/yr (latest 3 years weighted 3 / 2 / 1.5, "
+            f"older 0.5), applied from the latest {rows[-1]['pct']:.1f}% with its effect halving each year, a "
+            f"one-year move capped at 20% of the prior year, never below 0 → {fmt_list(trend)}\n"
+            f"- **Flat:** recency-weighted average → {flat[0]:.1f}% every year\n"
+            + (f"- **Dollar growth:** SBC dollar CAGR {cagr:+.1%} × 80% = {0.8 * cagr:+.1%} a year, capped each year "
+               f"at projected revenue growth → {fmt_list(dollar)}" if dollar else
+               "- **Dollar growth:** not enough SBC history for a dollar CAGR, so it uses the Flat values")))
+        bt = sbc_backtest(rows)
+        if bt:
+            err = f" — error {bt['error']:+.0f}%" if bt["error"] is not None else ""
+            st.markdown(f"**Backtest:** using only {bt['first']}–{bt['through']}, the Trend method projected "
+                        f"{bt['target']} SBC at {bt['predicted']:.1f}% of revenue vs {bt['actual']:.1f}% actual{err} "
+                        f"({bt['predicted'] - bt['actual']:+.1f} pp).")
+        else:
+            st.markdown("**Backtest:** not available — it needs at least 4 years of SBC history (2 to fit the trend, "
+                        "plus the 2 years it projects).")
+    return sbc
+
+
+def render_sbc_dcf(proj, sbc, terminal, wacc, net_debt, shares, implied, price) -> None:
+    """DCF (after SBC): the standard DCF run on FCF − projected SBC, shown beside the standard result."""
+    r = run_dcf([p["fcf"] - s for p, s in zip(proj, sbc)], terminal, wacc, net_debt, shares)
+    st.subheader("Standard DCF vs DCF (after SBC)")
+    with st.container(border=True, key="sbc_dcf"):
+        cols = st.columns(3)
+        cols[0].metric("Standard DCF implied price", fmt_price(implied))
+        if r is None:
+            cols[1].metric("DCF (after SBC) implied price", "N/A")
+            st.caption("Final-year FCF after SBC is not positive, so the after-SBC terminal value is not meaningful.")
+        else:
+            up = upside(r["price"], price)
+            cols[1].metric("DCF (after SBC) implied price", fmt_price(r["price"]),
+                           delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
+            cols[2].metric("SBC drag", f"{fmt_price(implied - r['price'])} per share",
+                           help="Standard DCF implied price − DCF (after SBC) implied price.")
+        st.caption("DCF (after SBC) discounts FCF after SBC (FCF − projected SBC) with the same WACC, terminal growth, "
+                   "net debt and share count as the standard DCF. The share count is not also grown for SBC: "
+                   "deducting SBC and diluting the shares would count the same cost twice.")
+
+
+# --------------------------------------------------------------------------- #
+# Compounding calculator + goal solver
+# --------------------------------------------------------------------------- #
+def simulate_growth(start: float, monthly: float, annual_return: float, years: int, increase: float) -> pd.DataFrame:
+    """Monthly compounding, contributions at month end; the monthly contribution rises once a year."""
+    i = annual_return / 100 / 12
+    balance = contributed = float(start)
+    pmt, rows = float(monthly), []
+    for year in range(1, int(years) + 1):
+        if year > 1:
+            pmt *= 1 + increase / 100
+        for _ in range(12):
+            balance = balance * (1 + i) + pmt
+            contributed += pmt
+        rows.append({"Year": year, "Contributed": contributed, "Growth": balance - contributed, "End balance": balance})
+    return pd.DataFrame(rows)
+
+
+def required_monthly(target: float, years: int, start: float, annual_return: float) -> tuple[float, float]:
+    """Monthly contribution needed to reach the target (future value of an ordinary annuity).
+    Returns (required monthly, what the starting amount alone grows to)."""
+    n, i = int(years) * 12, annual_return / 100 / 12
+    grown = start * (1 + i) ** n
+    if grown >= target:
+        return 0.0, grown
+    if i == 0:
+        return (target - start) / n, grown
+    return (target - grown) * i / ((1 + i) ** n - 1), grown
+
+
+def _money_full(x: float) -> str:
+    return f"-${-x:,.0f}" if x < 0 else f"${x:,.0f}"
+
+
+def render_compounding() -> None:
+    _RUN["calc"] = True
+    for k in CALC_DEFAULTS:
+        seed_calc(k)
+    mode = st.radio("Mode", CALC_MODES, horizontal=True, key="calc_mode",
+                    index=CALC_MODES.index(st.session_state["calc_mode"]))
+    if mode == "Calculator":
+        c = st.columns(5)
+        start = c[0].number_input("Starting amount ($)", min_value=0.0, step=100.0, format="%.2f", **bound("calc_start"))
+        monthly = c[1].number_input("Monthly contribution ($)", min_value=0.0, step=25.0, format="%.2f",
+                                    **bound("calc_monthly"))
+        ret = c[2].number_input("Expected annual return (%)", min_value=-50.0, max_value=50.0, step=0.5,
+                                format="%.2f", **bound("calc_return"))
+        years = c[3].number_input("Years", min_value=1, max_value=60, step=1, **bound("calc_years"))
+        inc = c[4].number_input("Annual contribution increase (%)", min_value=0.0, max_value=50.0, step=0.5,
+                                format="%.2f", **bound("calc_increase"))
+        df = simulate_growth(start, monthly, ret, years, inc)
+        final, contributed = df["End balance"].iloc[-1], df["Contributed"].iloc[-1]
+        st.html(f'<div class="big-label">Final balance after {int(years)} years</div>'
+                f'<div class="big-figure">{html.escape(_money_full(final))}</div>')
+        st.html(tile_grid([("Total contributed (incl. starting amount)", _money_full(contributed)),
+                           ("Total growth", _money_full(final - contributed))]))
+        try:
+            import plotly.graph_objects as go
+
+            fig = go.Figure()
+            fig.add_scatter(x=df["Year"], y=df["Contributed"], name="Contributions", stackgroup="one",
+                            line=dict(color="#6b7280"), hovertemplate="Year %{x}: $%{y:,.0f}<extra>Contributions</extra>")
+            fig.add_scatter(x=df["Year"], y=df["Growth"], name="Growth", stackgroup="one",
+                            line=dict(color=GOLD), hovertemplate="Year %{x}: $%{y:,.0f}<extra>Growth</extra>")
+            fig.update_layout(height=360, margin=dict(t=10, b=8, l=6, r=6), dragmode=False,
+                              xaxis=dict(title="Year", fixedrange=True), yaxis=dict(tickprefix="$", fixedrange=True),
+                              legend=dict(orientation="h", x=0, y=-0.18, yanchor="top"))
+            st.plotly_chart(fig, width="stretch", config=CHART_CONFIG, key="calc_chart")
+        except ImportError:
+            pass
+        st.dataframe(pd.DataFrame({
+            "Year": df["Year"], "Contributed": df["Contributed"].map(_money_full),
+            "Growth": df["Growth"].map(_money_full), "End balance": df["End balance"].map(_money_full),
+        }).set_index("Year"), width="stretch")
+        st.caption("Monthly compounding at the annual return ÷ 12, contributions at the end of each month; the "
+                   "monthly contribution rises once a year by the increase %. Contributed includes the starting amount.")
+    else:
+        c = st.columns(4)
+        target = c[0].number_input("Target amount ($)", min_value=0.0, step=1000.0, format="%.2f", **bound("goal_target"))
+        years = c[1].number_input("Years", min_value=1, max_value=60, step=1, **bound("goal_years"))
+        start = c[2].number_input("Starting amount ($)", min_value=0.0, step=100.0, format="%.2f", **bound("goal_start"))
+        ret = c[3].number_input("Expected annual return (%)", min_value=-50.0, max_value=50.0, step=0.5, format="%.2f",
+                                **bound("goal_return"))
+        need, grown = required_monthly(target, years, start, ret)
+        st.html(f'<div class="big-label">Required monthly contribution</div>'
+                f'<div class="big-figure">{html.escape(f"${need:,.2f}")}</div>')
+        if need == 0:
+            st.success(f"Goal already covered: {_money_full(start)} growing at {ret:g}% a year for {int(years)} years "
+                       f"reaches {_money_full(grown)}, which meets the {_money_full(target)} target without monthly "
+                       "contributions.".replace("$", r"\$"))
+        df = simulate_growth(start, need, ret, years, 0.0)
+        st.dataframe(pd.DataFrame({
+            "Year": df["Year"], "Contributed": df["Contributed"].map(_money_full),
+            "Growth": df["Growth"].map(_money_full), "End balance": df["End balance"].map(_money_full),
+        }).set_index("Year"), width="stretch")
+        st.caption("Solved with the future value of an ordinary annuity, monthly compounding: required = (target − "
+                   "start × (1+i)ⁿ) × i ÷ ((1+i)ⁿ − 1), with i = annual return ÷ 12 and n = years × 12. At 0% return, "
+                   "required = (target − start) ÷ months.")
+
+
+# --------------------------------------------------------------------------- #
+# My Daily Feed: news (yfinance), posts (StockTwits), filings (SEC EDGAR)
+# --------------------------------------------------------------------------- #
+FEED_TTL = 30 * 60
+
+
+def _epoch(value) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        ts = pd.Timestamp(value)
+        ts = ts.tz_localize("UTC") if ts.tzinfo is None else ts
+        return ts.timestamp()
+    except (ValueError, TypeError):
+        return None
+
+
+def _http_url(url) -> str | None:
+    return url if isinstance(url, str) and url.startswith(("https://", "http://")) else None
+
+
+@st.cache_data(ttl=FEED_TTL, show_spinner=False)
+def feed_news(ticker: str) -> dict:
+    import yfinance as yf
+
+    fetched = time.time()
+    try:
+        raw = []
+        try:
+            raw = yf.Ticker(ticker).get_news(count=15) or []
+        except Exception:
+            raw = []
+        if not raw:
+            raw = yf.Search(ticker, news_count=15).news or []
+        items = []
+        for n in raw:
+            c = n.get("content") if isinstance(n.get("content"), dict) else n
+            related = n.get("relatedTickers")
+            if isinstance(related, list) and related and ticker not in [str(r).upper() for r in related]:
+                continue
+            url = None
+            for k in ("canonicalUrl", "clickThroughUrl"):
+                if isinstance(c.get(k), dict):
+                    url = url or _http_url(c[k].get("url"))
+            url = url or _http_url(c.get("link"))
+            provider = c.get("provider")
+            publisher = provider.get("displayName") if isinstance(provider, dict) else c.get("publisher")
+            if c.get("title") and url:
+                items.append({"source": "News", "ticker": ticker, "title": c["title"], "meta": publisher or "",
+                              "ts": _epoch(c.get("pubDate") or c.get("displayTime") or c.get("providerPublishTime")),
+                              "url": url})
+        return {"items": items, "error": None, "fetched_at": fetched}
+    except Exception as exc:
+        return {"items": [], "error": type(exc).__name__, "fetched_at": fetched}
+
+
+@st.cache_data(ttl=FEED_TTL, show_spinner=False)
+def feed_posts(ticker: str) -> dict:
+    fetched = time.time()
+    try:
+        r = requests.get(f"https://api.stocktwits.com/api/2/streams/symbol/{ticker}.json",
+                         headers={"User-Agent": "Mozilla/5.0 (compatible; JD-DCF-Model/1.0)"}, timeout=HTTP_TIMEOUT)
+        if r.status_code == 404:
+            return {"items": [], "error": None, "fetched_at": fetched}
+        if r.status_code != 200:
+            return {"items": [], "error": f"HTTP {r.status_code}", "fetched_at": fetched}
+        items = []
+        for msg in (r.json().get("messages") or [])[:15]:
+            user = (msg.get("user") or {}).get("username") or "unknown"
+            sentiment = ((msg.get("entities") or {}).get("sentiment") or {}).get("basic")
+            body = (msg.get("body") or "").strip()
+            if body:
+                items.append({"source": "Posts", "ticker": ticker, "title": body[:280] + ("…" if len(body) > 280 else ""),
+                              "meta": f"@{user}", "sentiment": sentiment, "ts": _epoch(msg.get("created_at")),
+                              "url": f"https://stocktwits.com/{user}/message/{msg.get('id')}"})
+        return {"items": items, "error": None, "fetched_at": fetched}
+    except Exception as exc:
+        return {"items": [], "error": type(exc).__name__, "fetched_at": fetched}
+
+
+@st.cache_data(ttl=FEED_TTL, show_spinner=False)
+def feed_filings(ticker: str) -> dict:
+    fetched = time.time()
+    try:
+        cik = lookup_cik(ticker)
+        if cik is None:
+            return {"items": [], "error": None, "fetched_at": fetched}
+        r = requests.get(f"https://data.sec.gov/submissions/CIK{cik:010d}.json", headers=sec_headers(),
+                         timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        recent = r.json()["filings"]["recent"]
+        items = []
+        for i in range(min(12, len(recent.get("form", [])))):
+            accn = recent["accessionNumber"][i]
+            doc = recent["primaryDocument"][i]
+            url = (f"https://www.sec.gov/Archives/edgar/data/{cik}/{accn.replace('-', '')}/{doc}" if doc else
+                   f"https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK={cik}")
+            desc = recent.get("primaryDocDescription", [""] * (i + 1))[i] or recent["form"][i]
+            items.append({"source": "Filings", "ticker": ticker, "title": f"{recent['form'][i]} — {desc}",
+                          "meta": f"filed {recent['filingDate'][i]}",
+                          "ts": _epoch(recent.get("acceptanceDateTime", [None] * (i + 1))[i] or recent["filingDate"][i]),
+                          "url": url})
+        return {"items": items, "error": None, "fetched_at": fetched}
+    except Exception as exc:
+        return {"items": [], "error": type(exc).__name__, "fetched_at": fetched}
+
+
+def refresh_feed() -> None:
+    feed_news.clear()
+    feed_posts.clear()
+    feed_filings.clear()
+
+
+def rel_time(ts: float | None) -> str:
+    if ts is None:
+        return "time unknown"
+    secs = time.time() - ts
+    if secs < 60:
+        return "just now"
+    if secs < 3600:
+        return f"{int(secs // 60)}m ago"
+    if secs < 86400:
+        return f"{int(secs // 3600)}h ago"
+    if secs < 7 * 86400:
+        return f"{int(secs // 86400)}d ago"
+    return dt.datetime.fromtimestamp(ts, dt.timezone.utc).strftime("%b %d, %Y")
+
+
+def _feed_card(item: dict) -> str:
+    badge = item["source"].lower()
+    sentiment = item.get("sentiment")
+    sent_html = (f'<span class="feed-sent {"bull" if sentiment == "Bullish" else "bear"}">{html.escape(sentiment)}</span>'
+                 if sentiment in ("Bullish", "Bearish") else "")
+    return (f'<div class="feed-card"><div class="feed-meta"><span class="feed-badge {badge}">{item["source"].upper()}</span>'
+            f'<b>{html.escape(item["ticker"])}</b><span class="muted">{html.escape(item["meta"])}</span>'
+            f'<span class="muted">{rel_time(item["ts"])}</span>{sent_html}</div>'
+            f'<div class="feed-title"><a href="{html.escape(item["url"])}" target="_blank" rel="noopener noreferrer">'
+            f'{html.escape(item["title"])}</a></div></div>')
+
+
+def render_feed() -> None:
+    hl = holdings()
+    st.caption(PRIVACY_NOTE)
+    with st.form("feed_add", clear_on_submit=True, border=False):
+        c = st.columns([3, 1], vertical_alignment="bottom")
+        new = c[0].text_input("Add a ticker to your feed", placeholder="e.g. MSFT")
+        if c[1].form_submit_button("Add", width="stretch") and new.strip():
+            err = add_holding(new)
+            if err:
+                st.warning(err)
+    if hl:
+        st.caption("Tracking — tap ✕ to remove:")
+        with st.container(horizontal=True, key="feed_chips"):
+            for h in hl:
+                st.button(f"✕ {h['ticker']}", key=f"feed_rm_{h['ticker']}", on_click=remove_holding, args=(h["ticker"],))
+    if not hl:
+        st.info("Your feed is empty — add a ticker above to follow its news, posts and filings.")
+        return
+
+    tickers = [h["ticker"] for h in hl]
+    with st.spinner("Loading your feed…"):
+        results = {t: {"News": feed_news(t), "Posts": feed_posts(t), "Filings": feed_filings(t)} for t in tickers}
+    oldest = min(r["fetched_at"] for by in results.values() for r in by.values())
+    c = st.columns([3, 1], vertical_alignment="center")
+    c[0].caption(f"Last refreshed {dt.datetime.fromtimestamp(oldest, dt.timezone.utc).strftime('%b %d, %H:%M UTC')} "
+                 f"({rel_time(oldest)}). Feed data is cached for 30 minutes.")
+    c[1].button("↻ Refresh", key="feed_refresh", on_click=refresh_feed, width="stretch")
+
+    options = ["All", *tickers]
+    if st.session_state.get("feed_ticker") not in options:
+        st.session_state.pop("feed_ticker", None)
+    pick = st.pills("Ticker", options, default="All", key="feed_ticker") or "All"
+    sources = st.pills("Sources", ["News", "Posts", "Filings"], selection_mode="multi",
+                       default=["News", "Posts", "Filings"], key="feed_sources") or []
+
+    for t in tickers if pick == "All" else [pick]:
+        counts, notes = [], []
+        for src, res in results[t].items():
+            counts.append(f"{len(res['items'])} {src.lower()}")
+            if res["error"]:
+                notes.append(f"{src} unavailable right now ({res['error']})")
+        line = f"**{t}** — " + " · ".join(counts) + (f" · {'; '.join(notes)}" if notes else "")
+        st.caption(line)
+        if not any(res["items"] for res in results[t].values()):
+            st.info(f"No recent news, posts or filings found for {t}. The other tickers are unaffected.")
+
+    seen, items = set(), []
+    for t in tickers if pick == "All" else [pick]:
+        for src in sources:
+            for it in results[t][src]["items"]:
+                key = it["url"].lower() if it["url"] else it["title"].strip().lower()
+                tkey = it["title"].strip().lower()
+                if key in seen or tkey in seen:
+                    continue
+                seen.update({key, tkey})
+                items.append(it)
+    items.sort(key=lambda it: it["ts"] or 0, reverse=True)
+    if not sources:
+        st.info("Pick at least one source above to see items.")
+    elif not items:
+        st.info("Nothing to show for this filter yet.")
+    else:
+        st.html('<div class="feed-list">' + "".join(_feed_card(it) for it in items[:150]) + "</div>")
+
+
+# --------------------------------------------------------------------------- #
+# My Portfolio
+# --------------------------------------------------------------------------- #
+QUOTE_TTL = 5 * 60
+
+
+@st.cache_data(ttl=QUOTE_TTL, show_spinner=False)
+def live_quote(ticker: str) -> dict:
+    """Last price and previous close from yfinance (cached 5 minutes)."""
+    import yfinance as yf
+
+    price = prev = None
+    try:
+        fi = yf.Ticker(ticker).fast_info
+        price, prev = pos(fi.get("lastPrice")), pos(fi.get("previousClose"))
+    except Exception:
+        pass
+    return {"price": price, "prev": prev, "fetched_at": time.time()}
+
+
+def open_in_valuation(ticker: str) -> None:
+    st.session_state["ticker_query"] = ticker
+    st.session_state["view"] = "valuation"
+
+
+def _add_from_form() -> None:
+    t = st.session_state.get("pf_new_ticker", "")
+    err = add_holding(t, st.session_state.get("pf_new_shares"), st.session_state.get("pf_new_cost")) if t.strip() else None
+    st.session_state["_pf_error"] = err
+
+
+def render_portfolio() -> None:
+    hl = holdings()
+    st.caption(PRIVACY_NOTE)
+    with st.form("pf_add", clear_on_submit=True, border=False):
+        c = st.columns([1.2, 1, 1, 0.8], vertical_alignment="bottom")
+        c[0].text_input("Ticker", key="pf_new_ticker", placeholder="e.g. MSFT")
+        c[1].number_input("Shares (optional)", min_value=0.0, value=None, step=1.0, key="pf_new_shares")
+        c[2].number_input("Average cost $ (optional)", min_value=0.0, value=None, step=1.0, format="%.2f", key="pf_new_cost")
+        c[3].form_submit_button("Add holding", on_click=_add_from_form, width="stretch")
+    if st.session_state.pop("_pf_error", None):
+        st.warning("That doesn't look like a ticker symbol.")
+    if not hl:
+        st.info("No holdings yet — add a ticker above.")
+        return
+
+    quotes = {h["ticker"]: live_quote(h["ticker"]) for h in hl}
+    oldest = min(q["fetched_at"] for q in quotes.values())
+    c = st.columns([3, 1], vertical_alignment="center")
+    c[0].caption(f"Prices as of {dt.datetime.fromtimestamp(oldest, dt.timezone.utc).strftime('%b %d, %H:%M UTC')} "
+                 "(yfinance, refreshed every 5 minutes).")
+    c[1].button("↻ Refresh prices", key="pf_refresh", on_click=live_quote.clear, width="stretch")
+
+    st.markdown("**Holdings** — tap a ticker to open it in Valuation; shares and cost are optional.")
+    with st.container(key="pf_rows"):
+        for h in hl:
+            t = h["ticker"]
+            for key, field in ((f"pf_sh_{t}", "shares"), (f"pf_cost_{t}", "cost")):
+                if key not in st.session_state:
+                    st.session_state[key] = h[field]
+            cols = st.columns([1.1, 1, 1, 0.45], vertical_alignment="bottom")
+            cols[0].button(f"{t} ↗", key=f"pf_go_{t}", on_click=open_in_valuation, args=(t,), width="stretch",
+                           help=f"Open {t} in Valuation")
+            cols[1].number_input(f"{t} shares", min_value=0.0, step=1.0, placeholder="Shares", **bound(f"pf_sh_{t}"))
+            cols[2].number_input(f"{t} avg cost ($)", min_value=0.0, step=1.0, format="%.2f", placeholder="Avg cost",
+                                 **bound(f"pf_cost_{t}"))
+            cols[3].button("✕", key=f"pf_rm_{t}", on_click=remove_holding, args=(t,), help=f"Remove {t}",
+                           width="stretch")
+            h["shares"], h["cost"] = st.session_state[f"pf_sh_{t}"], st.session_state[f"pf_cost_{t}"]
+
+    rows, counted = [], []
+    for h in hl:
+        q = quotes[h["ticker"]]
+        price, prev = q["price"], q["prev"]
+        day_pct = price / prev - 1 if price and prev else None
+        row = {"Ticker": h["ticker"], "Shares": h["shares"], "Avg cost": h["cost"], "Price": price,
+               "Day change %": day_pct, "Market value": None, "Unrealized $": None, "Unrealized %": None,
+               "day_dollars": None}
+        if price and h["shares"] and h["cost"] is not None:
+            mv, basis = h["shares"] * price, h["shares"] * h["cost"]
+            row.update({"Market value": mv, "Unrealized $": mv - basis,
+                        "Unrealized %": (mv - basis) / basis if basis else None,
+                        "day_dollars": h["shares"] * (price - prev) if prev else 0.0, "basis": basis})
+            counted.append(row)
+        rows.append(row)
+
+    total_mv = sum(r["Market value"] for r in counted)
+    if counted:
+        total_basis = sum(r["basis"] for r in counted)
+        unreal = total_mv - total_basis
+        day = sum(r["day_dollars"] for r in counted)
+        day_pct = day / (total_mv - day) if total_mv - day else None
+        sign = lambda x: ("+" if x >= 0 else "−") + f"${abs(x):,.2f}"
+        st.html(tile_grid([
+            ("Total market value", f"${total_mv:,.2f}"), ("Total cost", f"${total_basis:,.2f}"),
+            ("Unrealized gain/loss", f"{sign(unreal)} ({unreal / total_basis:+.2%})" if total_basis else sign(unreal)),
+            ("Today's change", f"{sign(day)} ({day_pct:+.2%})" if day_pct is not None else sign(day)),
+        ], grid_cls="cols4"))
+    else:
+        st.info("Enter shares and average cost for a holding to see portfolio totals. Ticker-only entries show "
+                "price and day change only.")
+
+    fmt = lambda v, f: "—" if v is None else f(v)
+    st.dataframe(pd.DataFrame([{
+        "Ticker": r["Ticker"], "Shares": fmt(r["Shares"], lambda v: f"{v:,.4g}"),
+        "Avg cost": fmt(r["Avg cost"], lambda v: f"${v:,.2f}"),
+        "Price": fmt(r["Price"], lambda v: f"${v:,.2f}") if r["Price"] else "unavailable",
+        "Market value": fmt(r["Market value"], lambda v: f"${v:,.2f}"),
+        "Day change %": fmt(r["Day change %"], lambda v: f"{v:+.2%}"),
+        "Unrealized $": fmt(r["Unrealized $"], lambda v: f"{'+' if v >= 0 else '−'}${abs(v):,.2f}"),
+        "Unrealized %": fmt(r["Unrealized %"], lambda v: f"{v:+.2%}"),
+        "Weight %": fmt(r["Market value"], lambda v: f"{v / total_mv:.1%}" if total_mv else "—"),
+    } for r in rows]).set_index("Ticker"), width="stretch")
+    if any(q["price"] is None for q in quotes.values()):
+        bad = ", ".join(t for t, q in quotes.items() if q["price"] is None)
+        st.caption(f"No price available for {bad} — check the symbol. Other holdings are unaffected.")
+
+    if counted:
+        try:
+            import plotly.graph_objects as go
+
+            alloc = sorted(counted, key=lambda r: r["Market value"])
+            fig = go.Figure(go.Bar(x=[r["Market value"] for r in alloc], y=[r["Ticker"] for r in alloc], orientation="h",
+                                   marker_color=GOLD, text=[f"{r['Market value'] / total_mv:.1%}" for r in alloc],
+                                   textposition="auto",
+                                   hovertemplate="%{y}: $%{x:,.2f}<extra></extra>"))
+            fig.update_layout(height=80 + 44 * len(alloc), margin=dict(t=30, b=8, l=6, r=6), dragmode=False,
+                              title=dict(text="Allocation by market value", font=dict(size=13)),
+                              xaxis=dict(tickprefix="$", fixedrange=True), yaxis=dict(fixedrange=True))
+            st.plotly_chart(fig, width="stretch", config=CHART_CONFIG, key="pf_alloc")
+        except ImportError:
+            pass
+
+
 storage_slot = st.container()  # fixed position for the (invisible) browser-storage component
 shown_ticker = None
 try:
     shown_ticker = main()
 except Exception as exc:  # last-resort guard: never show a traceback
-    st.error(f"Something went wrong while building the valuation: {type(exc).__name__}: {exc}")
+    st.error(f"Something went wrong while building this view: {type(exc).__name__}: {exc}")
 finally:
     try:
         persist_inputs(shown_ticker, storage_slot)
     except Exception:
         pass  # saving is best-effort; never break the page
     render_footer()
+    render_tabbar(st.session_state.get("view", "valuation"))
