@@ -1437,7 +1437,7 @@ def shares_used_text(info: dict) -> str:
 
 
 def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt, share_info: dict, price,
-               sbc: list | None = None) -> float | None:
+               sbc: list | None = None, shares_outstanding=None) -> float | None:
     """Render the DCF section. Returns the implied price (equity value ÷ diluted shares)."""
     st.header("Discounted Cash Flow")
     c1, c2 = st.columns(2)
@@ -1510,7 +1510,8 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
     if implied <= 0:
         st.warning("Net debt exceeds the DCF enterprise value, so the implied equity value is negative.")
     if sbc:
-        render_sbc_dcf(proj, sbc, terminal, wacc, net_debt, shares, implied, price)
+        # The after-SBC cash flows already deduct SBC, so that block divides by shares outstanding.
+        render_sbc_dcf(proj, sbc, terminal, wacc, net_debt, pos(shares_outstanding) or shares, implied, price)
 
     return implied if implied > 0 else None
 
@@ -1682,6 +1683,8 @@ def render_how_it_works() -> None:
                     "(else the provider's figure for that year, else current shares outstanding, labelled) — so "
                     "options, RSUs and convertibles that will become shares are counted in the per-share value. "
                     "In loss years companies report diluted equal to basic, and that reported figure is used as-is. "
+                    "The DCF (after SBC) block instead divides by shares outstanding: its cash flows already deduct "
+                    "projected SBC, so also counting the awards in a diluted share count would charge for them twice. "
                     "The snapshot market cap and the multiples price targets keep using shares outstanding.")
         st.latex(r"PV(FCF_t) = \frac{FCF_t}{(1+r)^t}")
         st.latex(r"TV = \frac{FCF_5 (1+g_T)}{r - g_T} \qquad PV(TV) = \frac{TV}{(1+r)^5}")
@@ -1995,7 +1998,8 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
         show_dcf = st.checkbox("Show DCF anyway (not recommended for banks/insurers)", value=False,
                                key=f"force_dcf_{ticker}")
     if show_dcf:
-        dcf_price = render_dcf(ticker, proj, years, net_debt, dcf_share_count(history, base, m, shares), price, sbc)
+        dcf_price = render_dcf(ticker, proj, years, net_debt, dcf_share_count(history, base, m, shares), price, sbc,
+                               shares_outstanding=shares)
     else:
         st.header("Discounted Cash Flow")
         st.info("DCF hidden for this financial company — see the warning above.")
@@ -2480,6 +2484,7 @@ def render_sbc_dcf(proj, sbc, terminal, wacc, net_debt, shares, implied, price) 
     r = run_dcf([p["fcf"] - s for p, s in zip(proj, sbc)], terminal, wacc, net_debt, shares)
     st.subheader("Standard DCF vs DCF (after SBC)")
     with st.container(border=True, key="sbc_dcf"):
+        st.markdown(f"**Shares used: {shares / 1e6:,.1f}M (shares outstanding — SBC already deducted above)**")
         cols = st.columns(3)
         cols[0].metric("Standard DCF implied price", fmt_price(implied))
         if r is None:
