@@ -357,6 +357,16 @@ def edgar_fundamentals(cik: int) -> dict:
         "Cash",
     ])
     debt = total_debt_series(facts)
+    income_tax = annual_flow(facts, ["IncomeTaxExpenseBenefit"])
+    pretax = annual_flow(facts, [
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",
+        "IncomeLossFromContinuingOperationsBeforeIncomeTaxesMinorityInterestAndIncomeLossFromEquityMethodInvestments",
+    ])
+    assets_cur = instant_values(facts, ["AssetsCurrent"])
+    liab_cur = instant_values(facts, ["LiabilitiesCurrent"])
+    debt_cur_parts = [instant_values(facts, ["LongTermDebtCurrent", "LongTermDebtAndCapitalLeaseObligationsCurrent"]),
+                      instant_values(facts, ["ShortTermBorrowings", "CommercialPaper"])]
+    debt_cur_total = instant_values(facts, ["DebtCurrent"])
 
     # Fiscal years = period ends of the flow statements; keep the last 5.
     by_year = {d.year: d for d in sorted(set(revenue.index) | set(net_income.index) | set(ocf.index))}
@@ -365,10 +375,22 @@ def edgar_fundamentals(cik: int) -> dict:
     def at(series: pd.Series, d) -> float | None:
         return float(series[d]) if d in series.index else None
 
+    def operating_nwc(d) -> float | None:
+        """(current assets − cash) − (current liabilities − current debt) at a balance-sheet date."""
+        ca, cl, c = at(assets_cur, d), at(liab_cur, d), at(cash, d)
+        if ca is None or cl is None or c is None:
+            return None
+        if any(d in part.index for part in debt_cur_parts):
+            cur_debt = sum(at(part, d) or 0.0 for part in debt_cur_parts)
+        else:
+            cur_debt = at(debt_cur_total, d) or 0.0
+        return (ca - c) - (cl - cur_debt)
+
     rows = []
     for d in ends:
         o, c = at(ocf, d), at(capex, d)
         oi, da = at(op_income, d), at(dna, d)
+        pre, tax_exp, ni = at(pretax, d), at(income_tax, d), at(net_income, d)
         rows.append({
             "Fiscal Year": f"FY{d.year}",
             "Period End": d.date().isoformat(),
@@ -380,6 +402,12 @@ def edgar_fundamentals(cik: int) -> dict:
             "EBITDA": (oi + da) if oi is not None and da is not None else None,
             "EPS (diluted)": at(eps_diluted, d),
             "Diluted shares": at(diluted_shares, d),
+            "D&A": da,
+            "Income tax": tax_exp,
+            # Pre-tax income: the reported line, else net income + income tax expense.
+            "Pretax income": pre if pre is not None else (ni + tax_exp if ni is not None and tax_exp is not None else None),
+            "Pretax derived": pre is None and ni is not None and tax_exp is not None,
+            "Operating NWC": operating_nwc(d),
             "Stock-Based Compensation": at(sbc, d),
             "Cash": at(cash, d),
             "Total Debt": at(debt, d),
@@ -490,6 +518,7 @@ def fmp_market_data(symbol: str, api_key: str) -> dict:
         {
             "date": str(e.get("date", "")),
             "revenue": num(_pick(e, "revenueAvg", "estimatedRevenueAvg")),
+            "revenue_high": num(_pick(e, "revenueHigh", "estimatedRevenueHigh")),
             "ebitda": num(_pick(e, "ebitdaAvg", "estimatedEbitdaAvg")),
             "analysts": num(_pick(e, "numAnalystsRevenue", "numberAnalystEstimatedRevenue")),
             "eps": num(_pick(e, "epsAvg", "estimatedEpsAvg")),
@@ -637,7 +666,8 @@ def yf_estimates(symbol: str) -> dict:
         base = prev if prev is not None else pos(row.get("yearAgoRevenue"))
         if not avg or not base:
             break
-        out["revenue"].append({"growth": avg / base - 1, "analysts": num(row.get("numberOfAnalysts"))})
+        out["revenue"].append({"growth": avg / base - 1, "analysts": num(row.get("numberOfAnalysts")),
+                               "avg": avg, "high": pos(row.get("high")), "ref": base})
         prev = avg
     df = ticker.earnings_estimate
     for period in ("0y", "+1y"):
@@ -831,6 +861,7 @@ def build_defaults(base: dict, years: list[int], fmp_estimates: list | None, yf_
     """Default assumptions (all in %): consensus where available, otherwise latest actuals."""
     growth: list[float] = []
     margin: list[float] = []
+    levels: list[dict] = []   # estimate levels behind each consensus growth year (for the upper-range mode)
     source, analysts = None, None
 
     # FMP: consecutive fiscal-year estimates after the base period.
@@ -846,6 +877,7 @@ def build_defaults(base: dict, years: list[int], fmp_estimates: list | None, yf_
             if (d - last_date).days > 400 or len(growth) == YEARS:  # gap in coverage
                 break
             growth.append((e["revenue"] / prev - 1) * 100)
+            levels.append({"avg": e["revenue"], "high": pos(e.get("revenue_high")), "ref": prev})
             if e["ebitda"] is not None:
                 margin.append(e["ebitda"] / e["revenue"] * 100)
             prev, last_date = e["revenue"], d
@@ -857,6 +889,7 @@ def build_defaults(base: dict, years: list[int], fmp_estimates: list | None, yf_
     yf_est = yf_est or {}
     if not growth and yf_est.get("revenue"):
         growth = [e["growth"] * 100 for e in yf_est["revenue"]][:YEARS]
+        levels = [{"avg": e.get("avg"), "high": e.get("high"), "ref": e.get("ref")} for e in yf_est["revenue"]][:YEARS]
         analysts = yf_est["revenue"][0]["analysts"]
         source = "yfinance"
 
@@ -919,7 +952,68 @@ def build_defaults(base: dict, years: list[int], fmp_estimates: list | None, yf_
         "eps": eps,
         "eps_source": eps_source,
         "eps_analysts": eps_analysts,
+        "levels": levels[:n_growth],
+        "source": source,
     }
+
+
+UPPER_MARGIN_CAP = 1.5  # max margin expansion per year in the upper-range mode (percentage points)
+
+
+def margin_trend(history: pd.DataFrame, m: dict) -> float | None:
+    """Average annual change in the Adjusted EBITDA margin over up to the last 3 fiscal years
+    (provider EBITDA — normalized when available — plus SBC, over EDGAR revenue)."""
+    margins = []
+    for _, row in history.iterrows():
+        rev, end = pos(row.get("Revenue")), pd.Timestamp(row["Period End"])
+        prov = None
+        for a in m.get("annual") or []:
+            try:
+                if abs((pd.Timestamp(a["date"]) - end).days) <= 21:
+                    prov = a
+                    break
+            except (KeyError, ValueError):
+                continue
+        core = prov.get("ebitda_norm") if prov and prov.get("ebitda_norm") is not None else (prov or {}).get("ebitda")
+        sbc = num(row.get("Stock-Based Compensation"))
+        if sbc is None and prov:
+            sbc = prov.get("sbc")
+        margins.append(((core + (sbc or 0.0)) / rev * 100) if rev and core is not None else None)
+    changes = [b - a for a, b in zip(margins, margins[1:]) if a is not None and b is not None][-3:]
+    return sum(changes) / len(changes) if changes else None
+
+
+def upper_range_defaults(base: dict, years: list[int], cons: dict, trend: float | None) -> dict:
+    """Upper-range mode: the two analyst-estimate years use avg + 0.5 × (high − avg) (≈75th percentile),
+    out-years fade from Year 2; margins step up from the base-year margin by the company's own recent
+    trend (capped at +1.5 pts/yr), or stay flat if the trend is not positive."""
+    upper = [lv for lv in cons["levels"][:2] if lv.get("avg") and lv.get("high") and lv.get("ref")]
+    growth, shown = list(cons["growth"]), []
+    if upper and len(upper) == len(cons["levels"][:2]):
+        prev = upper[0]["ref"]
+        g = []
+        for lv in upper:
+            level = lv["avg"] + 0.5 * (lv["high"] - lv["avg"])
+            g.append((level / prev - 1) * 100)
+            shown.append((level, lv["avg"], lv["high"]))
+            prev = level
+        growth = g + fade(g[-1], YEARS - len(g))
+    base_margin = (safe_div(base["ebitda"], base["revenue"]) or 0.0) * 100
+    step = min(trend, UPPER_MARGIN_CAP) if trend is not None and trend > 0 else 0.0
+    margin = [base_margin + step * (k + 1) for k in range(YEARS)]
+    if shown:
+        est = "; ".join(f"{years[i]} revenue ${lv / 1e6:,.1f}M (avg ${a / 1e6:,.1f}M, high ${h / 1e6:,.1f}M)"
+                        for i, (lv, a, h) in enumerate(shown))
+        note = (f"**Upper-range default (≈75th percentile of analyst estimates)** for revenue growth: {est}; later years "
+                f"fade toward {LONG_RUN_GROWTH:.0f}%.")
+    else:
+        note = "**Upper-range mode:** no analyst estimate range is available, so revenue growth matches the consensus defaults."
+    note += (f" Adj. EBITDA margins expand {step:.2f} pts a year from the {base_margin:.1f}% base (the company's average "
+             f"annual margin change of {trend:+.2f} pts over up to 3 years, capped at +{UPPER_MARGIN_CAP} pts)."
+             if step > 0 else
+             f" Adj. EBITDA margins stay flat at the {base_margin:.1f}% base-year margin "
+             + ("(no positive margin trend)." if trend is not None else "(margin history unavailable)."))
+    return {"growth": [round(x, 1) for x in growth], "margin": [round(x, 1) for x in margin], "note": note}
 
 
 # --------------------------------------------------------------------------- #
@@ -989,14 +1083,19 @@ def bound(key: str) -> dict:
 
 # Inputs that are saved per ticker; older saved names (e.g. a removed method radio) are dropped.
 SAVED_INPUTS = {*(f"g{i}" for i in range(5)), *(f"m{i}" for i in range(5)), *(f"s{i}" for i in range(5)),
-                "sbc_method", "conv", "wacc", "terminal",
+                *(f"d{i}" for i in range(5)), *(f"c{i}" for i in range(5)), *(f"w{i}" for i in range(5)),
+                "tax", "dmode", "build", "sbc_method", "conv", "wacc", "terminal",
                 "pe_mult", "ps_mult", "ev_mult", "pfcf_mult"}
 
 
+MODE_CHOICES = ("dmode", "build")  # the user's mode choices survive "Reset to defaults"
+
+
 def reset_inputs(ticker: str) -> None:
-    """Restore every input for this ticker to its default and drop the saved copy."""
+    """Restore every input for this ticker to the active mode's defaults and drop the saved copy."""
     for name, default in st.session_state.get(f"_defaults_{ticker}", {}).items():
-        st.session_state[input_key(ticker, name)] = default
+        if name not in MODE_CHOICES:
+            st.session_state[input_key(ticker, name)] = default
     st.session_state.pop(f"_restored_{ticker}", None)
     st.session_state[f"_reset_{ticker}"] = True
 
@@ -1054,6 +1153,24 @@ def project(base_revenue: float, growth: list[float], margin: list[float], conve
         revenue = revenue * (1 + g / 100)
         ebitda = revenue * m / 100
         rows.append({"revenue": revenue, "ebitda": ebitda, "fcf": ebitda * conversion / 100})
+    return rows
+
+
+def project_detailed(base_revenue: float, growth, margin, da_pct, capex_pct, nwc_pct, tax_rate) -> list[dict]:
+    """Detailed build, per year: Revenue → Adj. EBITDA → EBIT (− D&A) → NOPAT (tax on EBIT, no floor:
+    a negative EBIT gives a tax benefit) → Unlevered FCF = NOPAT + D&A − Capex − ΔNWC."""
+    rows, revenue, t = [], base_revenue, tax_rate / 100
+    for i in range(len(growth)):
+        revenue = revenue * (1 + growth[i] / 100)
+        ebitda = revenue * margin[i] / 100
+        da = revenue * da_pct[i] / 100
+        ebit = ebitda - da
+        tax = ebit * t
+        nopat = ebit - tax
+        capex = revenue * capex_pct[i] / 100
+        dnwc = revenue * nwc_pct[i] / 100
+        rows.append({"revenue": revenue, "ebitda": ebitda, "da": da, "ebit": ebit, "tax": tax, "nopat": nopat,
+                     "capex": capex, "dnwc": dnwc, "fcf": nopat + da - capex - dnwc})
     return rows
 
 
@@ -1245,8 +1362,24 @@ def render_snapshot(m: dict, fcf_for_yield: float | None, price) -> None:
     st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable.")
 
 
+DEFAULT_MODES = ["Consensus", "Upper-range"]
+BUILD_MODES = ["Detailed", "Simple"]
+
+
+def switch_defaults_mode(ticker: str, by_mode: dict) -> None:
+    """Mode switch: re-default only boxes still at the previous mode's default; edited boxes are kept."""
+    new = st.session_state[input_key(ticker, "dmode")]
+    old = next(m for m in DEFAULT_MODES if m != new)
+    for kind in ("growth", "margin"):
+        for i in range(YEARS):
+            key = input_key(ticker, f"{kind[0]}{i}")
+            if key in st.session_state and _same(st.session_state[key], by_mode[old][kind][i]):
+                st.session_state[key] = by_mode[new][kind][i]
+
+
 def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_rows: list[dict] | None,
-                 market_cap) -> tuple[list[dict], list, list | None] | None:
+                 market_cap, upper: dict | None = None, share_info: dict | None = None
+                 ) -> tuple[list[dict], list, list | None] | None:
     """Assumption boxes, SBC projection, calculated table and bar chart.
     Returns (projected years, projected EPS, projected SBC $ per year or None)."""
     st.header("Financial Model")
@@ -1262,19 +1395,48 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
     for note in base["notes"]:
         st.caption(md_escape(note))
 
-    # Seed every box (saved value first, else default) before any widget is created.
+    comp = base.get("components") or {"available": False}
+    by_mode = {"Consensus": {"growth": defaults["growth"], "margin": defaults["margin"]},
+               "Upper-range": upper or {"growth": defaults["growth"], "margin": defaults["margin"]}}
+    # Seed every box (saved value first, else the active mode's default) before any widget is created.
+    dmode_key = seed_input(ticker, "dmode", "Consensus", options=DEFAULT_MODES)
+    build_key = seed_input(ticker, "build", "Detailed" if comp["available"] else "Simple", options=BUILD_MODES)
+    active = by_mode[st.session_state[dmode_key]]
     for i in range(YEARS):
-        seed_input(ticker, f"g{i}", defaults["growth"][i])
-        seed_input(ticker, f"m{i}", defaults["margin"][i])
+        seed_input(ticker, f"g{i}", active["growth"][i])
+        seed_input(ticker, f"m{i}", active["margin"][i])
+        if comp["available"]:
+            seed_input(ticker, f"d{i}", round(comp["da_pct"], 2))
+            seed_input(ticker, f"c{i}", round(comp["capex_pct"], 2))
+            seed_input(ticker, f"w{i}", round(comp["nwc_pct"], 2))
+    if comp["available"]:
+        seed_input(ticker, "tax", round(comp["tax_rate"], 1))
     seed_input(ticker, "conv", defaults["conversion"])
+    detailed = st.session_state[build_key] == "Detailed" and comp["available"]
+    # Streamlit drops the state of widgets that are not drawn, so carry the hidden build's boxes across reruns.
+    hidden = ["conv"] if detailed else [f"{p}{i}" for p in "dcw" for i in range(YEARS)] + ["tax"] if comp["available"] else []
+    for k in hidden:
+        st.session_state[input_key(ticker, k)] = st.session_state[input_key(ticker, k)]
 
     st.markdown(ASSUMPTION_CSS, unsafe_allow_html=True)
     with st.container(border=True, key="assumptions"):
         top = st.columns([3, 1], vertical_alignment="center")
         top[0].subheader("Projection Assumptions — edit any box to run your own case")
-        top[1].button("Reset to consensus" if defaults["is_consensus"] else "Reset to defaults",
-                      on_click=reset_inputs, args=(ticker,), width="stretch",
-                      help="Restores every input for this ticker to its default and deletes your saved inputs.")
+        top[1].button("Reset to defaults", on_click=reset_inputs, args=(ticker,), width="stretch",
+                      help="Restores every input for this ticker to the active mode's defaults and deletes your saved inputs.")
+        modes = st.columns(2, vertical_alignment="bottom")
+        modes[0].segmented_control("Defaults", DEFAULT_MODES, required=True, key=dmode_key,
+                                   default=st.session_state[dmode_key], on_change=switch_defaults_mode,
+                                   args=(ticker, by_mode),
+                                   help="Consensus: analyst averages. Upper-range: ≈75th percentile of analyst revenue "
+                                        "estimates and the company's own margin-improvement trend.")
+        modes[1].segmented_control("Build", BUILD_MODES, required=True, key=build_key,
+                                   default=st.session_state[build_key],
+                                   help="Detailed: EBITDA → EBIT → NOPAT → unlevered FCF from D&A, capex, ΔNWC and tax. "
+                                        "Simple: FCF = Adj. EBITDA × FCF conversion %.")
+        if not comp["available"]:
+            st.caption("Detailed build unavailable for this ticker (SEC EDGAR lacks base-year D&A or capex), so the "
+                       "Simple (FCF conversion) build is used.")
         restored = st.session_state.get(f"_restored_{ticker}")
         if restored is not None:
             st.caption(f"💾 Restored your saved assumptions for this ticker (saved {fmt_saved_at(restored)}).")
@@ -1290,30 +1452,64 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
                     for i, col in enumerate(st.columns(YEARS)):
                         col.number_input(f"{years[i]}E", step=0.5, format="%.1f",
                                          **bound(input_key(ticker, f"{kind}{i}")))
-        with st.container(key="conv_row"):
-            cols = st.columns([1.6, 1, 3], vertical_alignment="center")
-            cols[0].markdown("**FCF conversion %**",
-                             help="FCF ÷ Adjusted EBITDA. Projected FCF = projected Adjusted EBITDA × conversion %.")
-            cols[1].number_input("FCF conversion % (all years)", step=1.0, format="%.1f", label_visibility="collapsed",
-                                 **bound(input_key(ticker, "conv")))
-        st.caption(md_escape(base["conv_calc"]))
-        conv_now = st.session_state[input_key(ticker, "conv")]
-        if base["conv_unusual"]:
-            st.warning(f"⚠️ The company's actual conversion is {base['conversion']:.1f}%, which is unusually "
-                       f"{'high' if base['conversion'] > 100 else 'low'} and may not be sustainable. "
-                       "Consider entering a long-run rate instead.")
-        if conv_now > 100 and not _same(conv_now, defaults["conversion"]):
-            st.warning("FCF conversion above 100% means free cash flow exceeds Adjusted EBITDA every year. That can "
-                       "happen briefly (e.g. working-capital releases) but is not sustainable long-term.")
+        if detailed:
+            for label, kind, help_text in (
+                ("D&A % of revenue", "d", "D&A = revenue × D&A %. Deducted to get EBIT, then added back to NOPAT."),
+                ("Capex % of revenue", "c", "Capex = revenue × capex %, deducted from FCF."),
+                ("ΔNWC % of revenue", "w", "Change in net working capital = revenue × ΔNWC %, deducted from FCF. "
+                                          "Enter a negative % for working capital releasing cash."),
+            ):
+                with st.container(key=f"row_{kind}"):
+                    st.markdown(f"**{label}**", help=help_text)
+                    with st.container(key=f"grid_{kind}"):
+                        for i, col in enumerate(st.columns(YEARS)):
+                            col.number_input(f"{years[i]}E", step=0.1, format="%.2f",
+                                             **bound(input_key(ticker, f"{kind}{i}")))
+            with st.container(key="conv_row"):  # same compact single-box row style as the conversion box
+                cols = st.columns([1.6, 1, 3], vertical_alignment="center")
+                cols[0].markdown("**Tax rate %**", help="Applied once to EBIT, with no floor: a negative EBIT gives a tax benefit.")
+                cols[1].number_input("Tax rate % (all years)", step=0.5, format="%.1f", label_visibility="collapsed",
+                                     **bound(input_key(ticker, "tax")))
+        else:
+            with st.container(key="conv_row"):
+                cols = st.columns([1.6, 1, 3], vertical_alignment="center")
+                cols[0].markdown("**FCF conversion %**",
+                                 help="FCF ÷ Adjusted EBITDA. Projected FCF = projected Adjusted EBITDA × conversion %.")
+                cols[1].number_input("FCF conversion % (all years)", step=1.0, format="%.1f", label_visibility="collapsed",
+                                     **bound(input_key(ticker, "conv")))
+            st.caption(md_escape(base["conv_calc"]))
+            conv_now = st.session_state[input_key(ticker, "conv")]
+            if base["conv_unusual"]:
+                st.warning(f"⚠️ The company's actual conversion is {base['conversion']:.1f}%, which is unusually "
+                           f"{'high' if base['conversion'] > 100 else 'low'} and may not be sustainable. "
+                           "Consider entering a long-run rate instead.")
+            if conv_now > 100 and not _same(conv_now, defaults["conversion"]):
+                st.warning("FCF conversion above 100% means free cash flow exceeds Adjusted EBITDA every year. That can "
+                           "happen briefly (e.g. working-capital releases) but is not sustainable long-term.")
         save_note = (" Your changes save automatically in this browser." if storage_available()
                      else " Browser storage is unavailable, so changes will not be saved.")
-        st.caption(defaults["caption"] + save_note)
+        caption = defaults["caption"]
+        if st.session_state[dmode_key] == "Upper-range" and upper:
+            caption = upper["note"] + " Consensus reference: " + caption.replace("**", "").replace("Defaults: ", "", 1)
+        if detailed:
+            caption += (f" Detailed build defaults (flat across years): D&A {comp['da_pct']:.2f}% and capex "
+                        f"{comp['capex_pct']:.2f}% of revenue ({base['label']}, SEC EDGAR); ΔNWC {comp['nwc_pct']:.2f}% "
+                        f"({comp['nwc_note']}); tax {comp['tax_rate']:.1f}% ({comp['tax_note']}). These do not change "
+                        "with the defaults mode.")
+        st.caption(md_escape(caption + save_note))
 
     growth = [st.session_state[input_key(ticker, f"g{i}")] for i in range(YEARS)]
     margin = [st.session_state[input_key(ticker, f"m{i}")] for i in range(YEARS)]
     conversion = st.session_state[input_key(ticker, "conv")]
-    proj = project(base["revenue"], growth, margin, conversion)
-    eps = project_eps(base["eps"], base["ebitda"], proj, defaults["eps"])
+    if detailed:
+        read = lambda kind: [st.session_state[input_key(ticker, f"{kind}{i}")] for i in range(YEARS)]
+        proj = project_detailed(base["revenue"], growth, margin, read("d"), read("c"), read("w"),
+                                st.session_state[input_key(ticker, "tax")])
+        diluted = (share_info or {}).get("count")
+        eps = [p["nopat"] / diluted if pos(diluted) else None for p in proj]  # EPS = NOPAT ÷ diluted shares
+    else:
+        proj = project(base["revenue"], growth, margin, conversion)
+        eps = project_eps(base["eps"], base["ebitda"], proj, defaults["eps"])
     if sbc_rows is None:  # gated: not a software company under $20B
         st.caption(SBC_GATE_NOTE)
         sbc = None
@@ -1323,29 +1519,50 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
     labels = [f"{base['label']} Actual"] + [f"{y}E" for y in years]
     chart_labels = [f"{base['label']}<br>Actual"] + labels[1:]  # two-line label keeps ticks horizontal
     base_margin = safe_div(base["ebitda"], base["revenue"])
-    table = pd.DataFrame(
-        {
-            "Revenue": [fmt_money(base["revenue"])] + [fmt_money(p["revenue"]) for p in proj],
-            "Adjusted EBITDA": [fmt_money(base["ebitda"])] + [fmt_money(p["ebitda"]) for p in proj],
-            "Adj. EBITDA margin %": [fmt_pct(base_margin)] + [fmt_pct(p["ebitda"] / p["revenue"]) for p in proj],
-            "Free Cash Flow": [fmt_money(base["fcf"])] + [fmt_money(p["fcf"]) for p in proj],
-            "EPS (diluted)": [fmt_price(base["eps"])] + [fmt_price(e) for e in eps],
-        },
-        index=labels,
-    ).T
+    if detailed:
+        actual = base_detailed_actuals(base, comp)
+        chart_base = {**base, "fcf": actual["fcf"] if actual["fcf"] is not None else base["fcf"]}
+        rows = [("Revenue", "revenue"), ("Adjusted EBITDA", "ebitda"), ("Less: D&A", "da"), ("EBIT", "ebit"),
+                ("Less: Tax", "tax"), ("NOPAT", "nopat"), ("Plus: D&A", "da"), ("Less: Capex", "capex"),
+                ("Less: Change in NWC", "dnwc"), ("Unlevered FCF", "fcf")]
+        table = pd.DataFrame({name: [fmt_money(actual[k])] + [fmt_money(p[k]) for p in proj] for name, k in rows},
+                             index=labels).T
+    else:
+        chart_base = base
+        table = pd.DataFrame(
+            {
+                "Revenue": [fmt_money(base["revenue"])] + [fmt_money(p["revenue"]) for p in proj],
+                "Adjusted EBITDA": [fmt_money(base["ebitda"])] + [fmt_money(p["ebitda"]) for p in proj],
+                "Adj. EBITDA margin %": [fmt_pct(base_margin)] + [fmt_pct(p["ebitda"] / p["revenue"]) for p in proj],
+                "Free Cash Flow": [fmt_money(base["fcf"])] + [fmt_money(p["fcf"]) for p in proj],
+                "EPS (diluted)": [fmt_price(base["eps"])] + [fmt_price(e) for e in eps],
+            },
+            index=labels,
+        ).T
     if sbc:
         base_sbc = sbc_rows[-1]["sbc"] if sbc_rows and sbc_rows[-1]["end"] == base["end"] else None
         table.loc["Stock-Based Compensation"] = [fmt_money(base_sbc)] + [fmt_money(v) for v in sbc]
-        base_after = base["fcf"] - base_sbc if base["fcf"] is not None and base_sbc is not None else None
+        actual_fcf = chart_base["fcf"]
+        base_after = actual_fcf - base_sbc if actual_fcf is not None and base_sbc is not None else None
         table.loc["FCF after SBC"] = [fmt_money(base_after)] + [fmt_money(p["fcf"] - v) for p, v in zip(proj, sbc)]
-    st.dataframe(table, width="stretch")
-    st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. "
-               f"Actual FCF = operating cash flow − capex. Actual Adjusted EBITDA: {base['ebitda_source']}. "
-               f"Actual EPS: {base['eps_source']}.")
+    if detailed:
+        table.loc["Adj. EBITDA margin %"] = [fmt_pct(base_margin)] + [fmt_pct(p["ebitda"] / p["revenue"]) for p in proj]
+        table.loc["EPS (NOPAT ÷ diluted shares)"] = [fmt_price(base["eps"])] + [fmt_price(e) for e in eps]
+    st.dataframe(table, width="stretch", height=(len(table) + 1) * 35 + 3,  # every row visible, no inner scroll
+                 column_config={"_index": st.column_config.Column(width=215)})  # longest row label fits
+    if detailed:
+        st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. Revenue, D&A, capex "
+                   f"and the change in operating working capital are reported; EBIT, tax and NOPAT are derived with the "
+                   f"{comp['tax_rate']:.1f}% default tax rate. Actual Adjusted EBITDA: {base['ebitda_source']}. "
+                   f"Actual EPS: {base['eps_source']}.")
+    else:
+        st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. "
+                   f"Actual FCF = operating cash flow − capex. Actual Adjusted EBITDA: {base['ebitda_source']}. "
+                   f"Actual EPS: {base['eps_source']}.")
     try:
         import plotly.graph_objects as go
 
-        fig = model_chart(chart_labels, base, proj, eps)
+        fig = model_chart(chart_labels, chart_base, proj, eps)
         # Desktop: same figure without Plotly's grouped legend, plus a horizontal HTML legend.
         with st.container(key="desk_chart"):
             st.plotly_chart(go.Figure(fig).update_layout(showlegend=False), width="stretch",
@@ -1356,8 +1573,29 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
             st.plotly_chart(fig, width="stretch", config=CHART_CONFIG, key="chart_mobile")
     except ImportError:
         st.warning("Install plotly (`pip install plotly`) to see the chart.")
-    st.caption(eps_caption(defaults, years, eps, base))
+    if detailed:
+        cnt = (share_info or {}).get("count")
+        st.caption(f"EPS (diluted, $/share, right axis): {base['label']} actual = {base['eps_source']}. Projected EPS = "
+                   f"NOPAT ÷ diluted shares" + (f" ({cnt / 1e6:,.1f}M, {share_info['source']})." if pos(cnt) else
+                                               " — unavailable (no share count)."))
+    else:
+        st.caption(eps_caption(defaults, years, eps, base))
     return proj, eps, sbc
+
+
+def base_detailed_actuals(base: dict, comp: dict) -> dict:
+    """Base-year column for the detailed build: reported revenue, EBITDA, D&A, capex and ΔNWC; EBIT, tax and
+    NOPAT derived with the default tax rate; unlevered FCF from those."""
+    out = {"revenue": base["revenue"], "ebitda": base["ebitda"], "da": comp["da"], "capex": comp["capex"],
+           "dnwc": comp.get("dnwc")}
+    if base["ebitda"] is not None:
+        out["ebit"] = base["ebitda"] - comp["da"]
+        out["tax"] = out["ebit"] * comp["tax_rate"] / 100
+        out["nopat"] = out["ebit"] - out["tax"]
+        out["fcf"] = out["nopat"] + comp["da"] - comp["capex"] - (comp.get("dnwc") or 0.0)
+    else:
+        out.update(ebit=None, tax=None, nopat=None, fcf=None)
+    return out
 
 
 def ntm_figures(base_end: pd.Timestamp, years: list[int], proj: list[dict], eps: list,
@@ -1660,10 +1898,24 @@ def render_how_it_works() -> None:
                     "compensation add-back is SEC EDGAR's ShareBasedCompensation, disclosed in the model "
                     "footnote. EDGAR operating income + D&A is used only when the provider has no EBITDA. "
                     "EPS₀ is reported diluted EPS (EDGAR, else the provider).")
-        st.markdown("**Projection model** (t = 1…5; g_t, m_t and c are the editable assumption boxes)")
-        st.latex(r"Revenue_t = Revenue_{t-1} \times (1 + g_t)")
-        st.latex(r"\text{Adj. EBITDA}_t = Revenue_t \times m_t")
-        st.latex(r"FCF_t = \text{Adj. EBITDA}_t \times c")
+        st.markdown("**Projection model** (t = 1…5; every percentage is an editable assumption box). The default "
+                    "**Detailed** build constructs unlevered free cash flow explicitly:")
+        st.latex(r"Revenue_t = Revenue_{t-1} \times (1 + g_t) \qquad \text{Adj. EBITDA}_t = Revenue_t \times m_t")
+        st.latex(r"EBIT_t = \text{Adj. EBITDA}_t - D\&A_t \qquad NOPAT_t = EBIT_t \times (1 - \tau)")
+        st.latex(r"\text{Unlevered FCF}_t = NOPAT_t + D\&A_t - Capex_t - \Delta NWC_t")
+        st.markdown("D&A, capex and ΔNWC are revenue × their %; tax is applied once to EBIT with no floor (a negative "
+                    "EBIT gives a tax benefit). Defaults come from the latest fiscal year on SEC EDGAR: D&A ÷ revenue, "
+                    "capex ÷ revenue, the change in operating working capital ((current assets − cash) − (current "
+                    "liabilities − current debt)) ÷ revenue, positive meaning cash outflow (0.0 if the tags are missing), "
+                    "and tax expense ÷ pre-tax income clamped to 0–40% (21% if pre-tax income is not positive). Projected "
+                    "EPS = NOPAT ÷ diluted shares. If EDGAR lacks D&A or capex, the **Simple** build is used instead, "
+                    "and it can be chosen manually:")
+        st.latex(r"FCF_t = \text{Adj. EBITDA}_t \times c \quad \text{(Simple build)}")
+        st.markdown("**Defaults mode.** Consensus uses analyst averages. Upper-range uses avg + 0.5 × (high − avg) "
+                    "(≈75th percentile) for the two analyst-estimate years, fades out-years the same way, and expands "
+                    "Adj. EBITDA margins by the company's own average annual margin change over up to 3 years (capped at "
+                    "+1.5 pts a year; flat if the trend is not positive). D&A, capex, ΔNWC and tax defaults do not change "
+                    "with the mode. Switching modes re-defaults only boxes you have not edited.")
         st.latex(r"c_{\text{default}} = \frac{\text{TTM FCF}}{\text{TTM Adjusted EBITDA}} "
                  r"\quad \text{(same provider, same four quarters)}")
         st.markdown("**Default assumptions.** Revenue growth: consensus revenue estimate ÷ prior-year revenue. "
@@ -1731,6 +1983,34 @@ def render_footer() -> None:
     st.divider()
     render_how_it_works()
     st.caption(f"**{FOOTER}**")
+
+
+def detailed_components(history: pd.DataFrame, base: dict) -> dict:
+    """Default D&A %, capex %, ΔNWC % and tax rate for the detailed build, from the latest EDGAR fiscal year."""
+    comp = {"available": False}
+    if history.empty or not pos(base.get("revenue")):
+        return comp
+    row = history.iloc[-1]
+    prev = history.iloc[-2] if len(history) > 1 else None
+    rev, da, capex, fy = base["revenue"], num(row.get("D&A")), num(row.get("Capex")), base["label"]
+    if da is None or capex is None:
+        return comp
+    comp.update(available=True, da=da, capex=capex, da_pct=da / rev * 100, capex_pct=capex / rev * 100)
+    nwc_now, nwc_prev = num(row.get("Operating NWC")), num(prev.get("Operating NWC")) if prev is not None else None
+    if nwc_now is not None and nwc_prev is not None:
+        comp.update(dnwc=nwc_now - nwc_prev, nwc_pct=(nwc_now - nwc_prev) / rev * 100,
+                    nwc_note=f"{fy} change in operating working capital, SEC EDGAR; positive = cash outflow")
+    else:
+        comp.update(dnwc=None, nwc_pct=0.0,
+                    nwc_note="defaulted to 0.0 — working-capital tags were not available on SEC EDGAR")
+    tax, pre = num(row.get("Income tax")), num(row.get("Pretax income"))
+    if tax is not None and pos(pre):
+        comp.update(tax_rate=min(max(tax / pre * 100, 0.0), 40.0),
+                    tax_note=f"{fy} effective rate, SEC EDGAR, clamped to 0–40%"
+                             + ("; pre-tax income = net income + tax" if bool(row.get("Pretax derived")) else ""))
+    else:
+        comp.update(tax_rate=21.0, tax_note="21% default — pre-tax income not positive or tax tags missing")
+    return comp
 
 
 def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
@@ -1822,6 +2102,8 @@ def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
         base["conv_note"] = "not computable — enter your own"
     base["conversion"] = round(ratio, 1)
     base["conv_unusual"] = ratio > 100 or ratio < 0
+
+    base["components"] = detailed_components(history, base)
 
     if base["eps"] is None and provider and provider["eps_diluted"] is not None:
         base["eps"], base["eps_source"] = provider["eps_diluted"], f"reported diluted EPS ({provider['source']})"
@@ -1988,7 +2270,9 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     # SBC is modelled only where dilution is typically material: software companies under $20B.
     # Otherwise its history is not built at all (sbc_rows = None) and saved SBC inputs are simply ignored.
     sbc_rows = sbc_history(history, m) if sbc_gate(m) else None
-    model = render_model(ticker, base, defaults, years, sbc_rows, m["market_cap"])
+    share_info = dcf_share_count(history, base, m, shares)
+    upper = upper_range_defaults(base, years, defaults, margin_trend(history, m) if not history.empty else None)
+    model = render_model(ticker, base, defaults, years, sbc_rows, m["market_cap"], upper=upper, share_info=share_info)
     proj, eps, sbc = model if model else (None, None, None)
 
     # ---- 4. DCF
@@ -1998,8 +2282,7 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
         show_dcf = st.checkbox("Show DCF anyway (not recommended for banks/insurers)", value=False,
                                key=f"force_dcf_{ticker}")
     if show_dcf:
-        dcf_price = render_dcf(ticker, proj, years, net_debt, dcf_share_count(history, base, m, shares), price, sbc,
-                               shares_outstanding=shares)
+        dcf_price = render_dcf(ticker, proj, years, net_debt, share_info, price, sbc, shares_outstanding=shares)
     else:
         st.header("Discounted Cash Flow")
         st.info("DCF hidden for this financial company — see the warning above.")
@@ -2029,10 +2312,9 @@ APP_CSS = f"""
 [data-testid="stHeader"] {{ background: color-mix(in srgb, var(--jd-base) 97%, transparent) !important;
     backdrop-filter: blur(6px); }}
 @media (min-width: 768px) {{
-    .st-key-row_g, .st-key-row_m {{ flex-direction: row !important; align-items: flex-end !important; flex-wrap: nowrap !important; }}
-    .st-key-row_g > div:first-child, .st-key-row_m > div:first-child {{ flex: 0 0 14% !important; width: 14% !important;
-        padding-bottom: 0.55rem; }}
-    .st-key-row_g > div:last-child, .st-key-row_m > div:last-child {{ flex: 1 1 auto !important; min-width: 0 !important; width: auto !important; }}
+    [class*="st-key-row_"] {{ flex-direction: row !important; align-items: flex-end !important; flex-wrap: nowrap !important; }}
+    [class*="st-key-row_"] > div:first-child {{ flex: 0 0 14% !important; width: 14% !important; padding-bottom: 0.55rem; }}
+    [class*="st-key-row_"] > div:last-child {{ flex: 1 1 auto !important; min-width: 0 !important; width: auto !important; }}
 }}
 /* Content surfaces stay solid over the texture. */
 [data-testid="stExpander"] details, [data-testid="stPlotlyChart"], .st-key-sbc_proj, .st-key-sbc_dcf,
@@ -2067,15 +2349,11 @@ APP_CSS = f"""
     [data-testid="stLayoutWrapper"]:has(> .st-key-topnav_mob) {{ display: flex !important; }}
     .st-key-topnav_mob button {{ padding: 4px 2px !important; }}
     .st-key-topnav_mob button p {{ font-size: 0.8rem; }}
-    .st-key-grid_g [data-testid="stHorizontalBlock"], .st-key-grid_m [data-testid="stHorizontalBlock"],
-    .st-key-grid_s [data-testid="stHorizontalBlock"] {{
+    [class*="st-key-grid_"] [data-testid="stHorizontalBlock"] {{
         flex-wrap: wrap !important; flex-direction: row !important; gap: 0.5rem !important; }}
-    .st-key-grid_g [data-testid="stColumn"], .st-key-grid_m [data-testid="stColumn"],
-    .st-key-grid_s [data-testid="stColumn"] {{
+    [class*="st-key-grid_"] [data-testid="stColumn"] {{
         flex: 0 0 calc((100% - 1rem) / 3) !important; width: calc((100% - 1rem) / 3) !important; min-width: 0 !important; }}
-    .st-key-grid_g [data-testid="stNumberInputStepDown"], .st-key-grid_g [data-testid="stNumberInputStepUp"],
-    .st-key-grid_m [data-testid="stNumberInputStepDown"], .st-key-grid_m [data-testid="stNumberInputStepUp"],
-    .st-key-grid_s [data-testid="stNumberInputStepDown"], .st-key-grid_s [data-testid="stNumberInputStepUp"],
+    [class*="st-key-grid_"] [data-testid="stNumberInputStepDown"], [class*="st-key-grid_"] [data-testid="stNumberInputStepUp"],
     .st-key-conv_row [data-testid="stNumberInputStepDown"], .st-key-conv_row [data-testid="stNumberInputStepUp"],
     .st-key-pf_rows [data-testid="stNumberInputStepDown"], .st-key-pf_rows [data-testid="stNumberInputStepUp"] {{
         display: none !important; }}
