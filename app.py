@@ -1419,6 +1419,17 @@ LENDER_INSURER_INDUSTRIES = ("bank", "credit services", "consumer lending", "mor
                              "thrift", "insurance", "insurer", "reinsurance")
 
 
+CAPITAL_MARKETS_INDUSTRIES = ("capital markets", "financial data", "stock exchange", "asset management")
+
+
+def capital_markets(industry: str | None, sic: int | None) -> bool:
+    """Fee-based financials (brokers, exchanges, asset managers, financial data): provider industry first;
+    without one, SIC 6200–6299 (e.g. 6211 security brokers, 6282 investment advice)."""
+    if industry:
+        return any(k in industry.lower() for k in CAPITAL_MARKETS_INDUSTRIES)
+    return sic is not None and 6200 <= sic < 6300
+
+
 def lender_or_insurer(industry: str | None, sic: int | None) -> bool:
     """Provider industry first; without one, the SEC SIC code: 6000–6199 depository and credit institutions
     (e.g. 6021/6022 commercial banks, 6120 savings institutions, 6141 personal credit, 6199 finance services)
@@ -2119,8 +2130,11 @@ def render_how_it_works() -> None:
                     "that average by Year 5 (it is never glided up); ΔNWC = the implied working-capital & other operating change, NOPAT + D&A − operating "
                     "cash flow, ÷ revenue, averaged over up to the three latest fiscal years, positive meaning cash "
                     "outflow (a year missing a component uses the balance-sheet change in operating working capital; "
-                    "0.0 if neither is available) — so the Actual column's unlevered FCF equals reported operating cash "
-                    "flow − capex; tax = the average effective rate (tax ÷ pre-tax income, each year clamped to 0–40%) "
+                    "0.0 if neither is available). If the balance-sheet method's 3-year average differs from it by more "
+                    "than 10 points, the balance-sheet average is used instead (except for brokers and other capital-markets "
+                    "firms, whose current assets are mostly customer receivables), and the default is capped at ±10% of "
+                    "revenue. The Actual column always uses the implied change, so its unlevered FCF equals reported "
+                    "operating cash flow − capex; tax = the average effective rate (tax ÷ pre-tax income, each year clamped to 0–40%) "
                     "over up to three recent years with positive pre-tax income, or 21% if there is none or the average "
                     "is 0% despite positive pre-tax income. Projected "
                     "EPS = NOPAT ÷ diluted shares. If EDGAR lacks D&A or capex, the **Simple** build is used instead, "
@@ -2230,11 +2244,17 @@ def year_adj_ebitda(row: pd.Series, m: dict) -> float | None:
     return core + (sbc or 0.0) if core is not None else None
 
 
-def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None, lender: bool = False) -> dict:
+NWC_DIVERGENCE = 10.0  # pts of revenue: beyond this the two ΔNWC methods disagree and the balance sheet is used
+NWC_CAP = 10.0         # the ΔNWC default is clamped to ±10% of revenue
+
+
+def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None, lender: bool = False,
+                        capital_markets: bool = False) -> dict:
     """Defaults for the detailed build. D&A % and capex %: latest EDGAR fiscal year. Tax rate: average
     effective rate over up to three fiscal years with positive pre-tax income. ΔNWC %: average over up to
     three fiscal years of the implied working-capital & other operating change, NOPAT + D&A − operating
-    cash flow (balance-sheet working capital for a year missing a component)."""
+    cash flow (balance-sheet working capital for a year missing a component), unless the balance-sheet
+    average differs by more than 10 pts (then that is used); clamped to ±10% of revenue."""
     comp = {"available": False}
     if history.empty or not pos(base.get("revenue")):
         return comp
@@ -2326,21 +2346,58 @@ def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None
         comp.update(nwc_pct=0.0, nwc_years=[],
                     nwc_note="defaulted to 0.0 — for a lender or insurer, operating cash flow includes loan and "
                              "policy flows, so the implied working-capital change is not a meaningful default")
-    elif per_year:
-        used = ", ".join(f"{label} {v:.2f}%" for label, v in reversed(per_year))
-        note = (f"{len(per_year)}-year average of the implied working-capital & other operating change (NOPAT + D&A − "
-                f"operating cash flow) ÷ revenue ({used}), SEC EDGAR; positive = cash outflow")
-        if fallback_years:
-            note += (f"; {', '.join(reversed(fallback_years))}: operating cash flow or a component unavailable, so "
-                     "the balance-sheet change in operating working capital is used")
-        comp.update(nwc_pct=sum(v for _, v in per_year) / len(per_year), nwc_years=per_year, nwc_note=note)
+        return comp
+
+    # Second candidate: the balance-sheet change in operating working capital, same years.
+    bs_years = []
+    for k in recent:
+        year_rev = rev if k == len(history) - 1 else num(history.iloc[k].get("Revenue"))
+        value = balance_sheet(k)
+        if value is not None and pos(year_rev):
+            bs_years.append((history.index[k], value / year_rev * 100))
+
+    def years_text(rows: list) -> str:
+        return ", ".join(f"{label} {v:.2f}%" for label, v in reversed(rows))
+
+    residual = sum(v for _, v in per_year) / len(per_year) if per_year else None
+    balance = sum(v for _, v in bs_years) / len(bs_years) if bs_years else None
+    residual_note = (f"{len(per_year)}-year average of the implied working-capital & other operating change (NOPAT + "
+                     f"D&A − operating cash flow) ÷ revenue ({years_text(per_year)}), SEC EDGAR; positive = cash outflow")
+    if fallback_years:
+        residual_note += (f"; {', '.join(reversed(fallback_years))}: operating cash flow or a component unavailable, "
+                          "so the balance-sheet change in operating working capital is used")
+    balance_note = (f"{len(bs_years)}-year average of the balance-sheet change in operating working capital ÷ revenue "
+                    f"({years_text(bs_years)}), SEC EDGAR; positive = cash outflow")
+    # The residual also sweeps in cash interest, tax timing and collateral, so when the two methods disagree
+    # by more than NWC_DIVERGENCE points the balance-sheet average is used — except for brokers and other
+    # capital-markets firms, whose current assets are mostly customer receivables.
+    diverged = residual is not None and balance is not None and abs(residual - balance) > NWC_DIVERGENCE
+    if diverged and capital_markets:
+        pct, years_used, note = residual, per_year, (
+            f"methods diverged (implied residual {residual:.2f}% vs balance sheet {balance:.2f}%) — residual kept: "
+            "for a broker or other capital-markets firm the balance-sheet method isn't meaningful, because its "
+            f"current assets are mostly customer receivables; {residual_note}")
+    elif diverged:
+        pct, years_used, note = balance, bs_years, (
+            f"methods diverged — balance-sheet average used (implied residual {residual:.2f}% vs balance sheet "
+            f"{balance:.2f}%): {balance_note}")
+    elif residual is not None:
+        pct, years_used, note = residual, per_year, residual_note
+    elif balance is not None:
+        pct, years_used, note = balance, bs_years, balance_note
     else:
         comp.update(nwc_pct=0.0, nwc_years=[],
                     nwc_note="defaulted to 0.0 — working-capital tags were not available on SEC EDGAR")
+        return comp
+    capped = min(max(pct, -NWC_CAP), NWC_CAP)
+    if capped != pct:
+        note += f"; capped at {capped:+.0f}% of revenue (uncapped {pct:.2f}%)"
+    comp.update(nwc_pct=capped, nwc_years=years_used, nwc_note=note)
     return comp
 
 
-def build_base(history: pd.DataFrame, m: dict, source: str, lender: bool = False) -> dict:
+def build_base(history: pd.DataFrame, m: dict, source: str, lender: bool = False,
+               capital_markets: bool = False) -> dict:
     """The single Actual year: latest EDGAR fiscal year, with market-data fallbacks."""
     notes: list[str] = []
     edgar_ebitda = sbc_edgar = None
@@ -2450,7 +2507,7 @@ def build_base(history: pd.DataFrame, m: dict, source: str, lender: bool = False
     base["conversion"] = round(ratio, 1)
     base["conv_unusual"] = (ratio > 100 or ratio < 0) and not base.get("conv_nm")
 
-    base["components"] = detailed_components(history, base, m, lender)
+    base["components"] = detailed_components(history, base, m, lender, capital_markets)
 
     if base["eps"] is None and provider and provider["eps_diluted"] is not None:
         base["eps"], base["eps_source"] = provider["eps_diluted"], f"reported diluted EPS ({provider['source']})"
@@ -2556,7 +2613,8 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     cash = num(edgar.get("cash")) if edgar.get("cash") is not None else num(m["total_cash"])
     debt = num(edgar.get("debt")) if edgar.get("debt") is not None else num(m["total_debt"])
     net_debt = (debt or 0.0) - (cash or 0.0) if cash is not None or debt is not None else None
-    base = build_base(history, m, source, lender=lender_or_insurer(m["industry"], m.get("sic")))
+    base = build_base(history, m, source, lender=lender_or_insurer(m["industry"], m.get("sic")),
+                      capital_markets=capital_markets(m["industry"], m.get("sic")))
     # EV/EBITDA uses Adjusted EBITDA too: TTM when the provider has quarters, else the base year.
     m["ebitda"] = m["ttm"]["adj_ebitda"] if m.get("ttm") else base["ebitda"]
     m["ev_ebitda"] = None  # recomputed below on Adjusted EBITDA
