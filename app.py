@@ -346,6 +346,17 @@ def filing_cover_shares(cik: int) -> tuple[float | None, str | None]:
     return shares, rec.get("reportDate", [None] * (i + 1))[i] or rec["filingDate"][i]
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def edgar_profile(cik: int) -> dict:
+    """SIC code and description from the EDGAR submissions record."""
+    sub = requests.get(f"https://data.sec.gov/submissions/CIK{int(cik):010d}.json", headers=sec_headers(),
+                       timeout=HTTP_TIMEOUT).json()
+    sic = sub.get("sic")
+    if not str(sic or "").isdigit():
+        raise EmptyFetch(cik)
+    return {"sic": int(sic), "sic_desc": sub.get("sicDescription")}
+
+
 def latest_shares(facts: dict, cover: tuple[float | None, str | None]) -> tuple[float | None, str | None]:
     """Shares outstanding: the cover-page total, else the balance-sheet count, else FY diluted shares."""
     if cover[0]:
@@ -397,6 +408,11 @@ def edgar_fundamentals(cik: int, financial: bool = False) -> dict:
         "PaymentsToAcquireOilAndGasPropertyAndEquipment",
         "PaymentsToAcquireOilAndGasProperty",
     ])
+    # Financial-format filers (e.g. brokers) split capex into other productive assets + capitalized software;
+    # used only for years the chain above leaves empty.
+    capex_parts = pd.concat([annual_flow(facts, ["PaymentsToAcquireOtherProductiveAssets"]),
+                             annual_flow(facts, ["PaymentsToDevelopSoftware"])], axis=1)
+    capex = capex.combine_first(capex_parts.sum(axis=1, min_count=1).dropna())
     op_income = annual_flow(facts, ["OperatingIncomeLoss"])
     sbc = annual_flow(facts, ["ShareBasedCompensation", "AllocatedShareBasedCompensationExpense"])
     diluted_shares = annual_flow(facts, ["WeightedAverageNumberOfDilutedSharesOutstanding"], unit="shares")
@@ -448,6 +464,15 @@ def edgar_fundamentals(cik: int, financial: bool = False) -> dict:
         o, c = at(ocf, d), at(capex, d)
         oi, da = at(op_income, d), at(dna, d)
         pre, tax_exp, ni = at(pretax, d), at(income_tax, d), at(net_income, d)
+        pre_any = pre if pre is not None else (ni + tax_exp if ni is not None and tax_exp is not None else None)
+        # EBITDA: operating income + D&A; filers without an operating-income line (banks, brokers) use
+        # pre-tax income + D&A instead.
+        if oi is not None and da is not None:
+            ebitda, ebitda_basis = oi + da, "operating income + D&A"
+        elif oi is None and pre_any is not None and da is not None:
+            ebitda, ebitda_basis = pre_any + da, "pre-tax income + D&A (no operating-income line)"
+        else:
+            ebitda, ebitda_basis = None, None
         rows.append({
             "Fiscal Year": f"FY{d.year}",
             "Period End": d.date().isoformat(),
@@ -456,13 +481,14 @@ def edgar_fundamentals(cik: int, financial: bool = False) -> dict:
             "Operating Cash Flow": o,
             "Capex": c,
             "Free Cash Flow": (o - c) if o is not None and c is not None else None,
-            "EBITDA": (oi + da) if oi is not None and da is not None else None,
+            "EBITDA": ebitda,
+            "EBITDA basis": ebitda_basis,
             "EPS (diluted)": at(eps_diluted, d),
             "Diluted shares": at(diluted_shares, d),
             "D&A": da,
             "Income tax": tax_exp,
             # Pre-tax income: the reported line, else net income + income tax expense.
-            "Pretax income": pre if pre is not None else (ni + tax_exp if ni is not None and tax_exp is not None else None),
+            "Pretax income": pre_any,
             "Pretax derived": pre is None and ni is not None and tax_exp is not None,
             "Operating NWC": operating_nwc(d),
             "Stock-Based Compensation": at(sbc, d),
@@ -540,11 +566,44 @@ def _first(data):
     return data if isinstance(data, dict) else None
 
 
+class EmptyFetch(Exception):
+    """A provider returned no usable data. Raised inside cached fetchers, so an empty result is never cached."""
+
+
+EMPTY_TTL = 5 * 60  # a failed or empty fetch is remembered this long, then tried again
+
+
+@st.cache_resource(show_spinner=False)
+def _fetch_failures() -> dict:
+    """(fetcher, args) → time until which a failed fetch is not retried; shared across sessions."""
+    return {}
+
+
+def resilient(fetch, *args, default=None):
+    """Call a cached fetcher, retrying once if it raises or comes back empty. Successful results stay in the
+    fetcher's own 24-hour cache; a failure is remembered for EMPTY_TTL only, so one bad fetch cannot hide a
+    ticker's data for a whole day."""
+    key = (fetch.__name__, *args)
+    failures = _fetch_failures()
+    if failures.get(key, 0) > time.time():
+        return default
+    for attempt in range(2):
+        try:
+            result = fetch(*args)
+            failures.pop(key, None)
+            return result
+        except Exception:
+            if attempt == 0:
+                time.sleep(0.5)
+    failures[key] = time.time() + EMPTY_TTL
+    return default
+
+
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def fmp_market_data(symbol: str, api_key: str) -> dict:
     profile = _first(_fmp_get("profile", symbol, api_key))
-    if not profile:
-        return {}
+    if not profile or num(_pick(profile, "price")) is None:
+        raise EmptyFetch(symbol)
     ratios = _first(_fmp_get("ratios-ttm", symbol, api_key)) or {}
     metrics = _first(_fmp_get("key-metrics-ttm", symbol, api_key)) or {}
     estimates = _fmp_get("analyst-estimates", symbol, api_key, period="annual", page=0, limit=10) or []
@@ -633,7 +692,7 @@ def yf_market_data(symbol: str) -> dict:
     info = ticker.info or {}
     price = num(_pick(info, "currentPrice", "regularMarketPrice", "previousClose"))
     if price is None:
-        return {}
+        raise EmptyFetch(symbol)
     div_rate = num(info.get("dividendRate"))
     div_yield = safe_div(div_rate, price) if div_rate else num(info.get("trailingAnnualDividendYield"))
     return {
@@ -740,6 +799,8 @@ def yf_estimates(symbol: str) -> dict:
             break
         out["eps"].append({"eps": num(df.loc[period].get("avg")),
                            "analysts": num(df.loc[period].get("numberOfAnalysts"))})
+    if not out["revenue"] and not out["eps"]:
+        raise EmptyFetch(symbol)
     return out
 
 
@@ -751,10 +812,7 @@ def get_market_data(symbol: str) -> tuple[dict, str, list[str]]:
     api_key = get_secret("FMP_API_KEY")
 
     if api_key:
-        try:
-            data = fmp_market_data(symbol, api_key)
-        except Exception:
-            data = {}
+        data = resilient(fmp_market_data, symbol, api_key, default={})
         if data.get("price"):
             source = "Financial Modeling Prep"
         else:
@@ -763,12 +821,11 @@ def get_market_data(symbol: str) -> tuple[dict, str, list[str]]:
 
     # yfinance is the fallback, and also fills any gaps left by FMP's free tier.
     if not data.get("price") or any(not data.get(k) for k in ("eps_fwd", "ebitda", "revenue_ttm", "annual", "ttm")):
-        try:
-            yf_data = yf_market_data(symbol)
-        except Exception:
-            yf_data = {}
-            if not data.get("price"):
-                warnings.append("yfinance request failed.")
+        yf_data = resilient(yf_market_data, symbol, default={})
+        if not yf_data and not data.get("price"):
+            warnings.append("Market data unavailable: yfinance returned no price for this ticker (tried twice; it will "
+                            "be retried in a few minutes). Price, market cap, sector/industry and price-based "
+                            "multiples are shown as N/A; fundamentals still come from SEC EDGAR.")
         if not data.get("price"):
             data = yf_data
         else:
@@ -1347,9 +1404,29 @@ def run_dcf(flows: list[float], terminal, wacc, net_debt, shares) -> dict | None
     }
 
 
-def is_financial(sector: str | None, industry: str | None) -> bool:
+def is_financial(sector: str | None, industry: str | None, sic: int | None = None) -> bool:
+    """Any financial company (selects the total-revenue concept); SIC 60–67 when the provider has no sector."""
     s, i = (sector or "").lower(), (industry or "").lower()
-    return "financial" in s or any(k in i for k in ("bank", "insurance", "insurer", "reinsurance"))
+    if s or i:
+        return "financial" in s or any(k in i for k in ("bank", "insurance", "insurer", "reinsurance"))
+    return sic is not None and 6000 <= sic < 6800 and sic != 6798  # 6798 = REITs
+
+
+# The firm-level DCF is gated only where debt and deposits are the business itself: balance-sheet lenders and
+# insurance underwriters. Brokerages, exchanges, asset managers and financial-data firms are fee businesses and
+# run the full model.
+LENDER_INSURER_INDUSTRIES = ("bank", "credit services", "consumer lending", "mortgage finance", "savings",
+                             "thrift", "insurance", "insurer", "reinsurance")
+
+
+def lender_or_insurer(industry: str | None, sic: int | None) -> bool:
+    """Provider industry first; without one, the SEC SIC code: 6000–6199 depository and credit institutions
+    (e.g. 6021/6022 commercial banks, 6120 savings institutions, 6141 personal credit, 6199 finance services)
+    and 6300–6399 insurance carriers (e.g. 6311 life). 6200s (brokers, exchanges, 6211 security brokers)
+    and 6282 investment advice are not gated."""
+    if industry:
+        return any(k in industry.lower() for k in LENDER_INSURER_INDUSTRIES)
+    return sic is not None and (6000 <= sic < 6200 or 6300 <= sic < 6400)
 
 
 def is_reit(sector: str | None, industry: str | None) -> bool:
@@ -1896,6 +1973,8 @@ def render_price_targets(ticker, m, share_info: dict, net_debt, ntm: dict | None
                "12-month price target. Target multiples default to the company's multiple today. Per-share "
                f"targets divide by {shares / 1e6:,.1f}M shares ({share_info['source']}), the same count as the DCF.")
 
+    on_fallback = [False]  # the last multiple is the generic fallback, not today's multiple or the user's own
+
     def target_input(label: str, name: str, today_value, fallback: float, basis: str, step: float) -> float:
         today_value = pos(today_value)
         default = round(float(today_value or fallback), 2 if step < 0.5 else 1)
@@ -1904,15 +1983,23 @@ def render_price_targets(ticker, m, share_info: dict, net_debt, ntm: dict | None
         value = st.number_input(label, min_value=0.0, step=step, help=note,
                                 **bound(seed_input(ticker, name, default, lo=0.0)))
         st.caption(note)
+        on_fallback[0] = not today_value and _same(value, default)
         return value
 
     def show(label: str, target: float, formula: str):
+        # Without a current price, a target on the generic fallback multiple is not a real target: it is
+        # labelled illustrative and kept out of the Summary.
+        illustrative = not pos(price) and on_fallback[0]
         col1, col2 = st.columns([1, 2])
         up = upside(target, price)
-        col1.metric(f"{label} 12-month target", fmt_price(target) if target > 0 else "N/A",
+        col1.metric(f"{label} 12-month target" + (" (illustrative)" if illustrative else ""),
+                    fmt_price(target) if target > 0 else "N/A",
                     delta=fmt_pct(up, signed=True) + " vs current" if up is not None and target > 0 else None)
         col2.markdown(f"<br/>{formula}", unsafe_allow_html=True)
-        if target > 0:
+        if illustrative:
+            st.caption("Illustrative — based on a fallback multiple, current price unavailable. Not included in the "
+                       "Summary.")
+        elif target > 0:
             results.append((label, target))
         else:
             st.warning(f"{label}: inputs produce a non-positive price, excluded from the summary.")
@@ -1977,7 +2064,9 @@ def render_summary(dcf_price: float | None, multiples: list[tuple], price) -> No
         else:
             target = None
             st.markdown("**12-Month Price Target**")
-            label, note = "12-month target", "No multiples method produced a positive 12-month target."
+            label, note = "12-month target", ("No multiples method produced a positive 12-month target." if pos(price)
+                                              else "Current price unavailable: targets on fallback multiples are "
+                                                   "illustrative only and are not summarized.")
         up = upside(target, price) if target else None
         st.metric(label, fmt_price(target) if target else "N/A",
                   delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
@@ -2141,7 +2230,7 @@ def year_adj_ebitda(row: pd.Series, m: dict) -> float | None:
     return core + (sbc or 0.0) if core is not None else None
 
 
-def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None) -> dict:
+def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None, lender: bool = False) -> dict:
     """Defaults for the detailed build. D&A % and capex %: latest EDGAR fiscal year. Tax rate: average
     effective rate over up to three fiscal years with positive pre-tax income. ΔNWC %: average over up to
     three fiscal years of the implied working-capital & other operating change, NOPAT + D&A − operating
@@ -2231,7 +2320,13 @@ def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None
             if k == len(history) - 1:
                 comp["dnwc"] = value  # base-year Actual column (implied, so Actual FCF = OCF − capex)
     comp.setdefault("dnwc", None)
-    if per_year:
+    if lender:
+        # A lender's operating cash flow includes loan originations and sales — the business itself — so the
+        # residual is not working capital. The Actual column still uses it (Actual FCF = OCF − capex).
+        comp.update(nwc_pct=0.0, nwc_years=[],
+                    nwc_note="defaulted to 0.0 — for a lender or insurer, operating cash flow includes loan and "
+                             "policy flows, so the implied working-capital change is not a meaningful default")
+    elif per_year:
         used = ", ".join(f"{label} {v:.2f}%" for label, v in reversed(per_year))
         note = (f"{len(per_year)}-year average of the implied working-capital & other operating change (NOPAT + D&A − "
                 f"operating cash flow) ÷ revenue ({used}), SEC EDGAR; positive = cash outflow")
@@ -2245,7 +2340,7 @@ def detailed_components(history: pd.DataFrame, base: dict, m: dict | None = None
     return comp
 
 
-def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
+def build_base(history: pd.DataFrame, m: dict, source: str, lender: bool = False) -> dict:
     """The single Actual year: latest EDGAR fiscal year, with market-data fallbacks."""
     notes: list[str] = []
     edgar_ebitda = sbc_edgar = None
@@ -2294,7 +2389,8 @@ def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
     elif provider and provider.get("ebitda") is not None:
         core, core_label = provider["ebitda"], f"{provider['source']} reported EBITDA"
     elif edgar_ebitda is not None:
-        core, core_label = edgar_ebitda, "SEC EDGAR operating income + D&A (no provider EBITDA)"
+        basis = history.iloc[-1].get("EBITDA basis") or "operating income + D&A"
+        core, core_label = edgar_ebitda, f"SEC EDGAR {basis} (no provider EBITDA)"
     if sbc_edgar is not None:
         sbc, sbc_label = sbc_edgar, "SEC EDGAR ShareBasedCompensation"
     elif provider and provider.get("sbc") is not None:
@@ -2319,7 +2415,16 @@ def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
     # Default FCF conversion: the company's actual TTM ratio, same provider and period, uncapped. A ratio on
     # non-positive Adjusted EBITDA (e.g. two negatives dividing to +260%) is not meaningful.
     ebitda_for_ratio = ttm["adj_ebitda"] if ttm and ttm["adj_ebitda"] else base["ebitda"]
-    if ebitda_for_ratio is not None and ebitda_for_ratio <= 0:
+    net_income = num(history.iloc[-1].get("Net Income")) if not history.empty else None
+    if lender and net_income is not None and pos(base["ebitda"]):
+        # A lender's operating cash flow includes loan originations and sales, so FCF ÷ EBITDA is not a usable
+        # conversion; free cash flow to equity is close to earnings, so net income stands in for FCF.
+        ratio = net_income / base["ebitda"] * 100
+        base["conv_calc"] = (f"{fy} net income {fmt_money(net_income)} ÷ {fy} Adj. EBITDA {fmt_money(base['ebitda'])} "
+                             f"= {ratio:.1f}% — earnings proxy: for a lender or insurer, operating cash flow includes "
+                             "loan and policy flows, so FCF ÷ Adj. EBITDA is not meaningful")
+        base["conv_note"] = f"{fy} net income ÷ Adj. EBITDA (earnings proxy for a lender/insurer)"
+    elif ebitda_for_ratio is not None and ebitda_for_ratio <= 0:
         ratio = 0.0
         which = f"TTM ({ttm['source']})" if ttm and ttm["adj_ebitda"] else fy
         base["conv_calc"] = (f"FCF conversion: Not meaningful — {which} Adjusted EBITDA is "
@@ -2345,7 +2450,7 @@ def build_base(history: pd.DataFrame, m: dict, source: str) -> dict:
     base["conversion"] = round(ratio, 1)
     base["conv_unusual"] = (ratio > 100 or ratio < 0) and not base.get("conv_nm")
 
-    base["components"] = detailed_components(history, base, m)
+    base["components"] = detailed_components(history, base, m, lender)
 
     if base["eps"] is None and provider and provider["eps_diluted"] is not None:
         base["eps"], base["eps_source"] = provider["eps_diluted"], f"reported diluted EPS ({provider['source']})"
@@ -2408,9 +2513,13 @@ def valuation_view(items: dict | None) -> str | None:
     if slot is not None:
         slot.html(loading_html(ticker))
     m, source, warnings = get_market_data(ticker)
-    financial = is_financial(m["sector"], m["industry"])
+    ciks = list(dict.fromkeys(c for c in (lookup_cik(ticker), PREDECESSOR_CIK.get(ticker)) if c is not None))
+    # SIC classifies the company when the provider has no sector/industry (e.g. a failed market-data fetch).
+    profile = resilient(edgar_profile, ciks[0], default={}) if ciks and not m["industry"] else {}
+    m["sic"], m["sic_desc"] = profile.get("sic"), profile.get("sic_desc")
+    financial = is_financial(m["sector"], m["industry"], m["sic"])
     edgar: dict = {"history": pd.DataFrame(), "note": "Ticker not found in the SEC company list."}
-    for cik in dict.fromkeys(c for c in (lookup_cik(ticker), PREDECESSOR_CIK.get(ticker)) if c is not None):
+    for cik in ciks:
         try:
             edgar = edgar_fundamentals(cik, financial)
         except Exception as exc:
@@ -2420,10 +2529,7 @@ def valuation_view(items: dict | None) -> str | None:
     yf_est = None
     fmp_est = m.get("estimates") or []
     if (m["price"] or not edgar["history"].empty) and not any(e.get("eps") is not None for e in fmp_est):
-        try:
-            yf_est = yf_estimates(ticker)
-        except Exception:
-            yf_est = None
+        yf_est = resilient(yf_estimates, ticker)
     st.session_state["_data_source"] = source
     st.session_state["_shown_ticker"] = ticker
     with slot.container() if slot is not None else st.container():
@@ -2450,7 +2556,7 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     cash = num(edgar.get("cash")) if edgar.get("cash") is not None else num(m["total_cash"])
     debt = num(edgar.get("debt")) if edgar.get("debt") is not None else num(m["total_debt"])
     net_debt = (debt or 0.0) - (cash or 0.0) if cash is not None or debt is not None else None
-    base = build_base(history, m, source)
+    base = build_base(history, m, source, lender=lender_or_insurer(m["industry"], m.get("sic")))
     # EV/EBITDA uses Adjusted EBITDA too: TTM when the provider has quarters, else the base year.
     m["ebitda"] = m["ttm"]["adj_ebitda"] if m.get("ttm") else base["ebitda"]
     m["ev_ebitda"] = None  # recomputed below on Adjusted EBITDA
@@ -2498,8 +2604,12 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     st.caption(caption)
 
     # ---- 7. Financials / REIT warning: the firm-level DCF and its model are gated behind an opt-in
-    financial = is_financial(m["sector"], m["industry"])
+    financial = lender_or_insurer(m["industry"], m.get("sic"))  # gated: balance-sheet lenders and insurers only
     reit = not financial and is_reit(m["sector"], m["industry"])
+    if not m["industry"] and m.get("sic"):
+        st.caption(f"Industry from SEC EDGAR (provider industry unavailable): SIC {m['sic']} — {m.get('sic_desc') or ''}. "
+                   + ("Classified as a lender/insurer, so the firm-level DCF is gated." if financial
+                      else "Not a lender or insurer, so the full model runs."))
     if financial:
         st.error(
             "### ⚠️ Firm-level DCF does not apply to banks and insurers\n"
