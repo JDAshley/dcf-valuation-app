@@ -1716,6 +1716,12 @@ def model_projection(ticker: str, base: dict, defaults: dict, detailed: bool, sh
     return proj, eps
 
 
+def explain(title: str, text: str, markdown: bool = False) -> None:
+    """A long explanation, moved as-is into a collapsed dropdown titled by its topic so the page stays short."""
+    with st.expander(title):
+        (st.markdown if markdown else st.caption)(text)
+
+
 def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_rows: list[dict] | None,
                  market_cap, upper: dict | None = None, share_info: dict | None = None, sbc_note: bool = False
                  ) -> tuple[list[dict], list, list | None] | None:
@@ -1814,7 +1820,8 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
                         f"flat); {comp['capex_note']}; ΔNWC {comp['nwc_pct']:.2f}% (flat; "
                         f"{comp['nwc_note']}); tax {comp['tax_rate']:.1f}% ({comp['tax_note']}). These do not change "
                         "with the defaults mode.")
-        st.caption(md_escape(caption + save_note))
+        explain("How the defaults are set", md_escape(caption))
+        st.caption(save_note.strip())
 
     proj, eps = model_projection(ticker, base, defaults, detailed, share_info)
     if sbc_rows is None:  # gated: not a software company under $20B
@@ -1859,14 +1866,14 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
     st.dataframe(table, width="stretch", height=(len(table) + 1) * 35 + 3,  # every row visible, no inner scroll
                  column_config={"_index": st.column_config.Column(width=215)})  # longest row label fits
     if detailed:
-        st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. Revenue, D&A and "
+        explain("About the Actual column", f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. Revenue, D&A and "
                    f"capex are reported; EBIT, tax and NOPAT are derived with the {base['label']} effective tax rate "
                    f"({comp['base_tax_rate']:.1f}%, or the default when pre-tax income is not positive); the change in NWC is the implied working-capital & other operating change (NOPAT + D&A − "
                    f"operating cash flow), so Actual unlevered FCF = operating cash flow − capex, the same Actual FCF "
                    f"as the Simple build. Actual Adjusted EBITDA: {base['ebitda_source']}. EPS: base-year EPS is "
                    f"{base['eps_source']}; projected EPS is NOPAT ÷ diluted shares.")
     else:
-        st.caption(f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. "
+        explain("About the Actual column", f"Actual column: {base['source']}, period ending {base['end'].date().isoformat()}. "
                    f"Actual FCF = operating cash flow − capex. Actual Adjusted EBITDA: {base['ebitda_source']}. "
                    f"EPS: base-year EPS is {base['eps_source']}; projected EPS follows the analyst consensus where "
                    f"available, else grows with projected EBITDA (Simple build has no NOPAT line; see the chart note).")
@@ -1886,11 +1893,11 @@ def render_model(ticker: str, base: dict, defaults: dict, years: list[int], sbc_
         st.warning("Install plotly (`pip install plotly`) to see the chart.")
     if detailed:
         cnt = (share_info or {}).get("count")
-        st.caption(f"EPS (diluted, $/share, right axis): {base['label']} actual = {base['eps_source']}. Projected EPS = "
+        explain("About the EPS line", f"EPS (diluted, $/share, right axis): {base['label']} actual = {base['eps_source']}. Projected EPS = "
                    f"NOPAT ÷ diluted shares" + (f" ({cnt / 1e6:,.1f}M, {share_info['source']})." if pos(cnt) else
                                                " — unavailable (no share count)."))
     else:
-        st.caption(eps_caption(defaults, years, eps, base))
+        explain("About the EPS line", eps_caption(defaults, years, eps, base))
     return proj, eps, sbc
 
 
@@ -2189,7 +2196,8 @@ def render_price_targets(ticker, m, share_info: dict, ntm: dict | None, yw: list
     cols[0].metric("NTM revenue", fmt_money(ntm["revenue"]))
     cols[1].metric("NTM free cash flow", fmt_money(ntm["fcf"]))
     cols[2].metric("NTM EPS (diluted)", fmt_price(ntm["eps"]))
-    st.caption("NTM = next twelve months from today, calendarized from your projections in the model above; the "
+    explain("How the price targets are built",
+            "NTM = next twelve months from today, calendarized from your projections in the model above; the "
                "default P/FCF and P/S multiples are market cap ÷ these NTM figures, so it is on a forward basis. "
                "Each method applies its one target multiple to the forward-12-month figures at each year mark: "
                "Year k uses months 12k+1 to 12k+12 from today, so Year 1 (months 13–24) is the forward year the "
@@ -2234,13 +2242,19 @@ def render_price_targets(ticker, m, share_info: dict, ntm: dict | None, yw: list
         st.number_input(meth["title"], min_value=0.0, step=meth["step"], help=md_escape(meth["note"]),
                         **bound(meth["key"]))
         st.caption(md_escape(meth["note"]))
+        figure = {"P/E": "Forward EPS", "P/FCF": "Forward FCF per share", "P/S": "Forward revenue per share"}[meth["label"]]
+        mult = st.session_state[meth["key"]]
+        mult_text = f"{mult:,.2f}x" if meth["step"] < 0.5 else f"{mult:,.1f}x"
         with st.container(key="grid_pt"):
             for k, (col, (metric, target)) in enumerate(zip(st.columns(YEARS), meth["cells"]), start=1):
                 up = upside(target, price) if target else None
+                # The year's basis lives in the tooltip: its window, the per-share figure and the arithmetic.
+                basis = f"Months {12 * k + 1}–{12 * k + 12} from today. {figure} {fmt_price(metric)}. " + (
+                    f"Target = {mult_text} × {fmt_price(metric)}." if target else
+                    f"No target: the {meth['metric']} is not positive.")
                 col.metric(f"Year {k}" + (" (illustrative)" if meth["illustrative"] else ""), fmt_price(target),
                            delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None,
-                           help=f"Months {12 * k + 1}–{12 * k + 12} from today")
-                col.caption(md_escape(f"{meth['metric']} {fmt_price(metric)} · mo {12 * k + 1}–{12 * k + 12}"))
+                           help=md_escape(basis))
         if meth["illustrative"]:
             st.caption("Illustrative — based on a fallback multiple, current price unavailable. Not included in the "
                        "Summary.")
@@ -2887,21 +2901,19 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
                    + ("Classified as a lender/insurer, so the firm-level DCF is gated." if financial
                       else "Not a lender or insurer, so the full model runs."))
     if financial:
-        st.error(
-            "### ⚠️ Firm-level DCF does not apply to banks and insurers\n"
-            "For banks and insurers, debt and deposits are *raw material* for the business, not financing. "
-            "That breaks the WACC and net-debt steps of an enterprise DCF, so the result is not meaningful. "
-            "Use **equity models** instead: dividend discount model, free cash flow to equity (FCFE), "
-            "residual income, or justified P/B. The multiples sections below still apply. "
-            "(For non-bank financials such as payment networks, a DCF may still be reasonable.)"
-        )
+        st.error("### ⚠️ Firm-level DCF does not apply to banks and insurers")
+        explain("Why the DCF is gated for banks and insurers",
+                "For banks and insurers, debt and deposits are *raw material* for the business, not financing. "
+                "That breaks the WACC and net-debt steps of an enterprise DCF, so the result is not meaningful. "
+                "Use **equity models** instead: dividend discount model, free cash flow to equity (FCFE), "
+                "residual income, or justified P/B. The multiples sections below still apply. "
+                "(For non-bank financials such as payment networks, a DCF may still be reasonable.)", markdown=True)
     elif reit:
-        st.error(
-            "### ⚠️ Firm-level DCF is a poor fit for REITs\n"
-            "Firm-level DCF is a poor fit for REITs: value is driven by FFO/AFFO and asset values, and the D&A "
-            "add-back overstates cash flow because property acquisitions sit outside capex. "
-            "The multiples sections below still apply."
-        )
+        st.error("### ⚠️ Firm-level DCF is a poor fit for REITs")
+        explain("Why the DCF is gated for REITs",
+                "Firm-level DCF is a poor fit for REITs: value is driven by FFO/AFFO and asset values, and the D&A "
+                "add-back overstates cash flow because property acquisitions sit outside capex. "
+                "The multiples sections below still apply.", markdown=True)
 
     # ---- 2. Snapshot
     fcf_for_yield = num(m["fcf_ttm"]) if m["fcf_ttm"] is not None else base["fcf"]
@@ -3026,6 +3038,9 @@ APP_CSS = f"""
 /* Yearly price targets: five across on desktop (the year-grid CSS wraps them 3 + 2 on phones) */
 .st-key-grid_pt [data-testid="stMetricValue"] {{ font-size: 1.35rem; }}
 .st-key-grid_pt [data-testid="stMetricDelta"] {{ font-size: 0.8rem; }}
+@media (max-width: 767px) {{  /* help tooltips stay inside the screen on phones */
+    [data-testid="stTooltipContent"] {{ max-width: calc(100vw - 32px) !important; box-sizing: border-box; }}
+}}
 @media (max-width: 767px) {{  /* narrow cells: the "% vs current" badge wraps instead of being cut off */
     .st-key-grid_pt [data-testid="stMetricDelta"], .st-key-grid_pt [data-testid="stMetricDelta"] * {{
         white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
@@ -3449,7 +3464,8 @@ def render_sbc_dcf(proj, sbc, terminal, wacc, net_debt, shares, implied, price) 
                            delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None)
             cols[2].metric("SBC drag", f"{fmt_price(implied - r['price'])} per share",
                            help="Standard DCF implied price − DCF (after SBC) implied price.")
-        st.caption("DCF (after SBC) discounts FCF after SBC (FCF − projected SBC) with the same WACC, terminal growth, "
+        explain("About the DCF (after SBC)",
+                "DCF (after SBC) discounts FCF after SBC (FCF − projected SBC) with the same WACC, terminal growth, "
                    "net debt and share count as the standard DCF. The share count is not also grown for SBC: "
                    "deducting SBC and diluting the shares would count the same cost twice.")
 
@@ -3528,7 +3544,8 @@ def render_compounding() -> None:
             "Year": df["Year"], "Contributed": df["Contributed"].map(_money_full),
             "Growth": df["Growth"].map(_money_full), "End balance": df["End balance"].map(_money_full),
         }).set_index("Year"), width="stretch")
-        st.caption("Monthly compounding at the annual return ÷ 12, contributions at the end of each month; the "
+        explain("How the calculation works",
+                "Monthly compounding at the annual return ÷ 12, contributions at the end of each month; the "
                    "monthly contribution rises once a year by the increase %. Contributed includes the starting amount.")
     else:
         c = st.columns(4)
