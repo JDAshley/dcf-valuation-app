@@ -1608,38 +1608,43 @@ def render_snapshot(m: dict, fcf_for_yield: float | None, price, trailing: dict)
     growth, growth_basis = m.get("peg_growth") or (None, None)
     peg = trailing["pe"] / growth if pos(trailing["eps"]) and pos(trailing["pe"]) and pos(growth) else None
     peg_fwd = m["pe_fwd"] / growth if pos(m["eps_fwd"]) and pos(m["pe_fwd"]) and pos(growth) else None
-    items = [
-        ("Trailing P/E", "N/A" if trailing["eps"] is not None and trailing["eps"] <= 0 else fmt_mult(trailing["pe"])),
-        ("Forward P/E", "N/A" if not pos(m["eps_fwd"]) else fmt_mult(m["pe_fwd"])),
-        ("PEG", fmt_mult(peg) if peg else "N/A"),
-        ("PEG (fwd)", fmt_mult(peg_fwd) if peg_fwd else "N/A"),
-        ("Price / Sales", fmt_mult(m["ps"])),
-        ("Price / Book", fmt_mult(m["pb"])),
-        ("EV / Sales", fmt_mult(m["ev_sales"])),
-        ("EV / Adj. EBITDA", "N/A" if not pos(m["ebitda"]) else fmt_mult(m["ev_ebitda"])),
-        ("FCF Yield", fmt_pct(safe_div(fcf_for_yield, m["market_cap"]))),
+    growth_help = (f"÷ {growth:.1f}% EPS growth, {growth_basis}" if pos(growth) else "no EPS growth rate is available")
+    items = [  # (label, value, tooltip)
+        ("Trailing P/E", "N/A" if trailing["eps"] is not None and trailing["eps"] <= 0 else fmt_mult(trailing["pe"]),
+         f"Price ÷ {trailing['note']}"),
+        ("Forward P/E", "N/A" if not pos(m["eps_fwd"]) else fmt_mult(m["pe_fwd"]), "Price ÷ consensus forward EPS."),
+        ("PEG", fmt_mult(peg) if peg else "N/A", f"Trailing P/E ({trailing['label']}) {growth_help}."),
+        ("PEG (fwd)", fmt_mult(peg_fwd) if peg_fwd else "N/A", f"Forward P/E {growth_help}."),
+        ("Price / Sales", fmt_mult(m["ps"]), None),
+        ("EV / Sales", fmt_mult(m["ev_sales"]), None),
+        ("EV / Adj. EBITDA", "N/A" if not pos(m["ebitda"]) else fmt_mult(m["ev_ebitda"]), None),
+        ("FCF Yield", fmt_pct(safe_div(fcf_for_yield, m["market_cap"])), None),
+        ("Dividend Yield", fmt_pct(m["div_yield"]) if pos(m["div_yield"]) else "None", None),
     ]
-    if pos(m["div_yield"]):
-        items.append(("Dividend Yield", fmt_pct(m["div_yield"])))
-    else:
-        items.append(("Dividend Yield", "None"))
     with st.container(key="desk_snapshot"):
         for start in range(0, len(items), 5):
             cols = st.columns(5)
-            for col, (label, value) in zip(cols, items[start:start + 5]):
-                col.metric(label, value)
+            for col, (label, value, tip) in zip(cols, items[start:start + 5]):
+                col.metric(label, value, help=md_escape(tip) if tip else None)
     with st.container(key="mob_snapshot"):
         tiles = [("Current price", fmt_price(price)), ("Market cap", fmt_money(m["market_cap"]))]
-        tiles += items[:-1]
+        tiles += [(label, value) for label, value, _ in items[:-1]]
         # Dividend Yield spans both columns when it would otherwise sit alone on the last row.
-        tiles.append((*items[-1], "wide") if len(tiles) % 2 == 0 else items[-1])
+        tiles.append((*items[-1][:2], "wide") if len(tiles) % 2 == 0 else items[-1][:2])
         st.html(tile_grid(tiles))
-    st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable. "
-               + md_escape(f"Trailing P/E = price ÷ {trailing['note']} "
-                           + (f"PEG = that trailing P/E ({trailing['label']}) ÷ {growth:.1f}% EPS growth; PEG (fwd) = "
-                              f"forward P/E (price ÷ consensus forward EPS) ÷ the same {growth:.1f}% — growth "
-                              f"{growth_basis}." if pos(growth)
-                              else "PEG and PEG (fwd) are N/A: no EPS growth rate is available.")))
+    # Short source labels only (the full basis is in each tile's tooltip on desktop).
+    labels = [f"Trailing P/E: {trailing['label']} {fmt_price(trailing['eps'])}"]
+    if pos(growth):
+        labels.append(f"PEG, PEG (fwd): {growth:.1f}% EPS growth ({peg_source(growth_basis)})")
+    st.caption(md_escape(" · ".join(labels)))
+
+
+def peg_source(basis: str) -> str:
+    """Short name for where the PEG growth rate comes from."""
+    for name, short in (("yfinance", "yfinance"), ("Financial Modeling Prep", "FMP")):
+        if name in basis:
+            return short
+    return "consensus EPS"
 
 
 DEFAULT_MODES = ["Consensus", "Upper-range"]
@@ -2033,15 +2038,33 @@ def shares_used_text(info: dict) -> str:
     return f"Shares used: {info['count'] / 1e6:,.1f}M (diluted unavailable — shares outstanding used)"
 
 
+STEPPER_STEP = 0.1  # percentage points per − / + tap
+
+
+def nudge(key: str, delta: float, lo: float, hi: float) -> None:
+    st.session_state[key] = round(min(max(st.session_state[key] + delta, lo), hi), 2)
+
+
+def stepper(col, label: str, key: str, lo: float, hi: float) -> float:
+    """A − [value] + control in place of a slider, so scrolling the page on a phone cannot change the value.
+    Each tap moves it by STEPPER_STEP; the middle box also takes a typed value."""
+    value = st.session_state[key]
+    with col.container(key=f"stepper_{key}"):
+        minus, box, plus = st.columns([1, 3, 1], vertical_alignment="bottom")
+        minus.button("−", key=f"{key}_dec", on_click=nudge, args=(key, -STEPPER_STEP, lo, hi), disabled=value <= lo,
+                     width="stretch")
+        plus.button("+", key=f"{key}_inc", on_click=nudge, args=(key, STEPPER_STEP, lo, hi), disabled=value >= hi,
+                    width="stretch")
+        return box.number_input(label, min_value=lo, max_value=hi, step=STEPPER_STEP, format="%.2f", **bound(key))
+
+
 def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt, share_info: dict, price,
                sbc: list | None = None, shares_outstanding=None) -> float | None:
     """Render the DCF section. Returns the implied price (equity value ÷ diluted shares)."""
     st.header("Discounted Cash Flow")
     c1, c2 = st.columns(2)
-    terminal = c1.slider("Terminal growth (%)", 0.0, 5.0, step=0.25,
-                         **bound(seed_input(ticker, "terminal", 2.5, 0.0, 5.0))) / 100
-    wacc = c2.slider("WACC / discount rate (%)", 4.0, 20.0, step=0.25,
-                     **bound(seed_input(ticker, "wacc", 9.0, 4.0, 20.0))) / 100
+    terminal = stepper(c1, "Terminal growth (%)", seed_input(ticker, "terminal", 2.5, 0.0, 5.0), 0.0, 5.0) / 100
+    wacc = stepper(c2, "WACC / discount rate (%)", seed_input(ticker, "wacc", 9.0, 4.0, 20.0), 4.0, 20.0) / 100
     shares = share_info["count"]
     if pos(shares):
         st.markdown(f"**{shares_used_text(share_info)}**")
@@ -2385,7 +2408,7 @@ def render_how_it_works() -> None:
                     "consensus forward EPS ÷ TTM EPS − 1; PEG (fwd) = forward P/E ÷ the same growth rate. Each is N/A "
                     "when its EPS or the growth rate is not positive.")
         st.latex(r"P/E = \frac{Price}{EPS} \quad PEG = \frac{P/E}{\text{EPS growth (\%)}} \quad "
-                 r"P/S = \frac{\text{Mkt Cap}}{\text{Revenue}} \quad P/B = \frac{Price}{\text{Book/Share}}")
+                 r"P/S = \frac{\text{Mkt Cap}}{\text{Revenue}}")
         st.latex(r"EV = \text{Mkt Cap} + \text{Debt} - \text{Cash} \quad EV/Sales \quad EV/EBITDA \quad "
                  r"\text{FCF Yield} = \frac{FCF}{\text{Mkt Cap}}")
         st.markdown("**Stock-based compensation** is modelled only for software companies under $20B market "
@@ -2989,6 +3012,16 @@ APP_CSS = f"""
         min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }}
     .st-key-conv_row [data-testid="stColumn"]:last-child {{ display: none !important; }}
 }}
+
+/* WACC / terminal growth steppers: − [value] + on one row at every width; the number box's own +/− are hidden */
+[class*="st-key-stepper_"] [data-testid="stHorizontalBlock"] {{
+    flex-wrap: nowrap !important; flex-direction: row !important; gap: 0.4rem !important; }}
+[class*="st-key-stepper_"] [data-testid="stColumn"] {{ min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }}
+[class*="st-key-stepper_"] [data-testid="stColumn"]:nth-child(2) {{ flex: 3 1 0 !important; }}
+[class*="st-key-stepper_"] [data-testid="stNumberInputStepDown"],
+[class*="st-key-stepper_"] [data-testid="stNumberInputStepUp"] {{ display: none !important; }}
+[class*="st-key-stepper_"] input {{ text-align: center; }}
+[class*="st-key-stepper_"] button p {{ font-size: 1.15rem; font-weight: 700; }}
 
 /* Yearly price targets: five across on desktop (the year-grid CSS wraps them 3 + 2 on phones) */
 .st-key-grid_pt [data-testid="stMetricValue"] {{ font-size: 1.35rem; }}
