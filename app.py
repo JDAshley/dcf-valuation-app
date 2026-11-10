@@ -357,6 +357,96 @@ def edgar_profile(cik: int) -> dict:
     return {"sic": int(sic), "sic_desc": sub.get("sicDescription")}
 
 
+def quarterly_values(facts: dict, concept: str, unit: str = "USD") -> dict:
+    """3-month values {quarter end: (value, derived?)} from 10-K/10-Q duration facts, the latest filing per
+    period. A quarter reported only year-to-date (typically Q4, in the 10-K) is derived as that YTD value
+    minus the YTD value with the same start ending one quarter earlier (e.g. fiscal year − nine months)."""
+    vals: dict[tuple, tuple] = {}
+    for f in _units(facts, concept, unit):
+        if f.get("form") not in ANNUAL_FORMS | QUARTERLY_FORMS or "start" not in f or num(f.get("val")) is None:
+            continue
+        try:
+            key = (pd.Timestamp(f["start"]), pd.Timestamp(f["end"]))
+        except ValueError:
+            continue
+        if key not in vals or f.get("filed", "") > vals[key][0]:
+            vals[key] = (f.get("filed", ""), float(f["val"]))
+    out = {e: (v, False) for (s, e), (_, v) in vals.items() if 80 <= (e - s).days <= 100}
+    for (s, e), (_, v) in vals.items():
+        if e in out or (e - s).days < 170:
+            continue
+        prior = next((pv for (ps, pe), (_, pv) in vals.items() if ps == s and 80 <= (e - pe).days <= 100), None)
+        if prior is not None:
+            out[e] = (v - prior, True)
+    return out
+
+
+def last_four_quarters(q: dict) -> list[tuple] | None:
+    """The four latest quarters [(end, value, derived?)], or None unless they are consecutive."""
+    ends = sorted(q)[-4:]
+    if len(ends) < 4 or any(not 80 <= (b - a).days <= 100 for a, b in zip(ends, ends[1:])):
+        return None
+    return [(e, *q[e]) for e in ends]
+
+
+TTM_NI_CONCEPTS = ("NetIncomeLossAvailableToCommonStockholdersBasic", "NetIncomeLoss")
+TTM_STALE_DAYS = 200  # a quarter plus the longest 10-K filing window, with slack
+
+
+def edgar_ttm(facts: dict) -> dict:
+    """Trailing-twelve-month net income (attributable to common where reported separately) from the last
+    four reported quarters, plus the sum of the same quarters' diluted EPS as a cross-check.
+    Returns {"ni", "concept", "quarters", "eps_sum", "eps_quarters"} or {"reason": why unavailable}."""
+    latest = max((pd.Timestamp(f["end"]) for c in TTM_NI_CONCEPTS for f in _units(facts, c, "USD")
+                  if f.get("form") in ANNUAL_FORMS | QUARTERLY_FORMS and "start" in f), default=None)
+    if latest is None:
+        return {"reason": "no net income facts on EDGAR"}
+    for concept in TTM_NI_CONCEPTS:
+        four = last_four_quarters(quarterly_values(facts, concept))
+        if four and four[-1][0] == latest:  # must end at the latest reported period
+            break
+    else:
+        return {"reason": "fewer than four consecutive quarters reported up to the latest period (e.g. no 10-Q "
+                          "filings, as for a 20-F filer)"}
+    out = {"ni": sum(v for _, v, _ in four), "concept": concept,
+           "quarters": [(e.date().isoformat(), v, d) for e, v, d in four], "eps_sum": None, "eps_quarters": None}
+    eps = last_four_quarters(quarterly_values(facts, "EarningsPerShareDiluted", "USD/shares"))
+    if eps and [e for e, _, _ in eps] == [e for e, _, _ in four]:
+        out["eps_sum"] = sum(v for _, v, _ in eps)
+        out["eps_quarters"] = [(e.date().isoformat(), v, d) for e, v, d in eps]
+    return out
+
+
+def ttm_eps(ttm: dict | None, share_info: dict, provider_eps, provider_pe, price, source: str) -> dict:
+    """The TTM EPS behind the trailing P/E display: EDGAR (TTM net income ÷ the DCF's diluted share count),
+    when it agrees within 10% with the sum of the quarters' reported diluted EPS; else the provider's."""
+    reason = (ttm or {}).get("reason") or ("EDGAR facts unavailable" if not ttm else None)
+    if not reason and (pd.Timestamp(dt.date.today()) - pd.Timestamp(ttm["quarters"][-1][0])).days > TTM_STALE_DAYS:
+        reason = (f"the latest EDGAR quarter ended {ttm['quarters'][-1][0]}, more than {TTM_STALE_DAYS} days ago "
+                  "(newer results are not on this filer's EDGAR record)")
+    if not reason and not pos(share_info.get("count")):
+        reason = "no diluted share count"
+    if not reason and ttm["eps_sum"] is None:
+        reason = "no quarterly diluted EPS reported for the same four quarters to cross-check"
+    if not reason:
+        eps = ttm["ni"] / share_info["count"]
+        if abs(eps - ttm["eps_sum"]) > 0.10 * max(abs(eps), abs(ttm["eps_sum"])):
+            reason = (f"net income ÷ diluted shares ({fmt_price(eps)}) and the sum of quarterly diluted EPS "
+                      f"({fmt_price(ttm['eps_sum'])}) differ by more than 10%")
+        else:
+            quarters = ", ".join(f"{pd.Timestamp(e).strftime('%b %Y')} {fmt_money(v)}" + (" (derived)" if d else "")
+                                 for e, v, d in ttm["quarters"])
+            return {"eps": eps, "pe": price / eps if pos(price) and eps > 0 else None, "label": "TTM EPS (EDGAR)",
+                    "note": (f"TTM EPS (EDGAR) {fmt_price(eps)} = {fmt_money(ttm['ni'])} net income"
+                             + (" attributable to common" if ttm["concept"].startswith("NetIncomeLossAvailable") else "")
+                             + f" for the four quarters ended {quarters} ÷ {share_info['count'] / 1e6:,.1f}M diluted "
+                             f"shares; cross-check: quarterly diluted EPS sum to {fmt_price(ttm['eps_sum'])}. "
+                             "A derived quarter is the fiscal year (or year-to-date) less the prior year-to-date.")}
+    eps = num(provider_eps)
+    return {"eps": eps, "pe": provider_pe, "label": f"TTM EPS ({source})", "reason": reason,
+            "note": f"TTM EPS ({source}) {fmt_price(eps)} — the EDGAR TTM EPS is not used: {reason}."}
+
+
 def latest_shares(facts: dict, cover: tuple[float | None, str | None]) -> tuple[float | None, str | None]:
     """Shares outstanding: the cover-page total, else the balance-sheet count, else FY diluted shares."""
     if cover[0]:
@@ -504,6 +594,10 @@ def edgar_fundamentals(cik: int, financial: bool = False) -> dict:
         except Exception:
             cover = (None, None)
     shares, shares_date = latest_shares(facts, cover)
+    try:
+        ttm = edgar_ttm(facts)
+    except Exception as e:  # never let the display-only TTM EPS break the fundamentals
+        ttm = {"reason": f"EDGAR quarterly data could not be read ({type(e).__name__})"}
     return {
         "name": facts.get("entityName"),
         "history": history,
@@ -515,6 +609,7 @@ def edgar_fundamentals(cik: int, financial: bool = False) -> dict:
         "shares_date": shares_date,
         "cover_shares": cover[0],
         "cover_date": cover[1],
+        "ttm": ttm,
         "note": None if rows else "No US-GAAP annual data found (foreign/IFRS filers are not supported).",
     }
 
@@ -1494,11 +1589,11 @@ def lookup_cik(ticker: str) -> int | None:
     return int(hit.iloc[0]["cik_str"]) if not hit.empty else None
 
 
-def render_snapshot(m: dict, fcf_for_yield: float | None, price) -> None:
+def render_snapshot(m: dict, fcf_for_yield: float | None, price, trailing: dict) -> None:
     st.header("Valuation Snapshot")
     eps_neg = m["eps_ttm"] is not None and m["eps_ttm"] <= 0
     items = [
-        ("Trailing P/E", "N/A" if eps_neg else fmt_mult(m["pe_ttm"])),
+        ("Trailing P/E", "N/A" if trailing["eps"] is not None and trailing["eps"] <= 0 else fmt_mult(trailing["pe"])),
         ("Forward P/E", "N/A" if not pos(m["eps_fwd"]) else fmt_mult(m["pe_fwd"])),
         ("PEG", "N/A" if eps_neg else fmt_mult(m["peg"])),
         ("Price / Sales", fmt_mult(m["ps"])),
@@ -1521,7 +1616,8 @@ def render_snapshot(m: dict, fcf_for_yield: float | None, price) -> None:
         tiles += [("PEG ratio" if label == "PEG" else label, value) for label, value in items[:-1]]
         tiles.append((items[-1][0], items[-1][1], "wide"))  # Dividend Yield spans both columns
         st.html(tile_grid(tiles))
-    st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable.")
+    st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable. "
+               + md_escape(f"Trailing P/E = price ÷ {trailing['note']}"))
 
 
 DEFAULT_MODES = ["Consensus", "Upper-range"]
@@ -2256,7 +2352,13 @@ def render_how_it_works() -> None:
                     "methods' Year-1 target; when two or more apply, it is their simple average, and when only one "
                     "applies it is that method's Year-1 value. The blended line averages the DCF with those Year-1 "
                     "targets and mixes both horizons, so it is shown only as a secondary reference.")
-        st.markdown("**Snapshot multiples**")
+        st.markdown("**Snapshot multiples.** Trailing P/E = price ÷ TTM EPS from SEC EDGAR: net income (attributable to "
+                    "common where reported separately) summed over the last four reported quarters, a quarter reported "
+                    "only year-to-date being derived as that YTD less the prior YTD (e.g. fiscal year − nine months), ÷ "
+                    "the diluted share count the DCF uses. It is cross-checked against the sum of the same quarters' "
+                    "reported diluted EPS; if they differ by more than 10%, either is unavailable (fewer than four "
+                    f"quarters, e.g. a 20-F filer) or the latest quarter is over {TTM_STALE_DAYS} days old, the provider's "
+                    "TTM EPS is used instead. The caption under the snapshot names the source.")
         st.latex(r"P/E = \frac{Price}{EPS} \quad PEG = \frac{P/E}{\text{EPS growth (\%)}} \quad "
                  r"P/S = \frac{\text{Mkt Cap}}{\text{Revenue}} \quad P/B = \frac{Price}{\text{Book/Share}}")
         st.latex(r"EV = \text{Mkt Cap} + \text{Debt} - \text{Cash} \quad EV/Sales \quad EV/EBITDA \quad "
@@ -2752,7 +2854,9 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
 
     # ---- 2. Snapshot
     fcf_for_yield = num(m["fcf_ttm"]) if m["fcf_ttm"] is not None else base["fcf"]
-    render_snapshot(m, fcf_for_yield, price)
+    share_info = dcf_share_count(history, base, m, shares, edgar.get("cover_shares"), edgar.get("cover_date"))
+    trailing = ttm_eps(edgar.get("ttm"), share_info, m["eps_ttm"], m["pe_ttm"], price, source)
+    render_snapshot(m, fcf_for_yield, price, trailing)
 
     # ---- 3. Projection model (1 actual year + 5 projected years) and 4. DCF
     years = [base["end"].year + i for i in range(1, YEARS + 1)]
@@ -2760,7 +2864,6 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     # SBC is modelled only where dilution is typically material: software companies under $20B.
     # Otherwise its history is not built at all (sbc_rows = None) and saved SBC inputs are simply ignored.
     sbc_rows = sbc_history(history, m) if sbc_gate(m) else None
-    share_info = dcf_share_count(history, base, m, shares, edgar.get("cover_shares"), edgar.get("cover_date"))
     upper = upper_range_defaults(base, years, defaults, margin_trend(history, m) if not history.empty else None)
     show_dcf = True
     if financial or reit:
