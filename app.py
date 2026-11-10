@@ -1207,7 +1207,7 @@ def bound(key: str) -> dict:
 SAVED_INPUTS = {*(f"g{i}" for i in range(5)), *(f"m{i}" for i in range(5)), *(f"s{i}" for i in range(5)),
                 *(f"d{i}" for i in range(5)), *(f"c{i}" for i in range(5)), *(f"w{i}" for i in range(5)),
                 "tax", "dmode", "build", "sbc_method", "conv", "wacc", "terminal",
-                "pe_mult", "ps_mult", "ev_mult", "pfcf_mult"}
+                "pe_mult", "ps_mult", "pfcf_mult"}  # a saved "ev_mult" (removed EV/EBITDA target) is dropped
 
 
 MODE_CHOICES = ("dmode", "build")  # the user's mode choices survive "Reset to defaults"
@@ -1789,12 +1789,16 @@ def base_detailed_actuals(base: dict, comp: dict) -> dict:
 
 def ntm_figures(base_end: pd.Timestamp, years: list[int], proj: list[dict], eps: list,
                 today: dt.date | None = None) -> dict | None:
-    """Next-twelve-months figures from the model's own projections.
+    """Next-twelve-months figures from the model's own projections: the window runs from today to
+    today + 12 months."""
+    return forward_window(base_end, years, proj, eps, pd.Timestamp(today or dt.date.today()))
 
-    The window runs from today to today + 12 months. Projected fiscal year i covers
-    (base end + i-1 years, base end + i years]; each year's projected value is weighted by the
-    share of the window it overlaps (time-weighted by days)."""
-    start = pd.Timestamp(today or dt.date.today())
+
+def forward_window(base_end: pd.Timestamp, years: list[int], proj: list[dict], eps: list,
+                   start: pd.Timestamp) -> dict | None:
+    """Figures for the 12 months from `start`, calendarized from the projections. Projected fiscal
+    year i covers (base end + i-1 years, base end + i years]; each year's projected value is weighted
+    by the share of the window it overlaps (time-weighted by days)."""
     end = start + pd.DateOffset(months=12)
     span = (end - start).days
     parts = []
@@ -1805,19 +1809,57 @@ def ntm_figures(base_end: pd.Timestamp, years: list[int], proj: list[dict], eps:
             parts.append((i, days / span))
     if not parts or abs(sum(w for _, w in parts) - 1) > 0.01:
         return None  # window not covered by the projection years
-    out = {"end": end, "parts": [(years[i], w) for i, w in parts]}
+    out = {"start": start, "end": end, "parts": [(years[i], w) for i, w in parts]}
     for k in ("revenue", "ebitda", "fcf"):
         out[k] = sum(w * proj[i][k] for i, w in parts)
     out["eps"] = sum(w * eps[i] for i, w in parts) if all(eps[i] is not None for i, _ in parts) else None
     return out
 
 
-def ntm_basis_text(ntm: dict) -> str:
-    """e.g. "12-month forward basis (to Oct 2027): 17% FY2026E + 83% FY2027E" (weights sum to 100%)."""
-    pcts = [round(w * 100) for _, w in ntm["parts"]]
+EXTENSION_YEARS = 2  # fade years past the model, used only to calendarize the later yearly target windows
+
+
+def extend_projection(proj: list[dict], eps: list, years: list[int], n: int = EXTENSION_YEARS):
+    """The projection plus `n` internal fade years, for calendarizing forward windows only (never shown or
+    valued): revenue growth keeps fading from the last model year's rate toward LONG_RUN_GROWTH, and
+    Adj. EBITDA, FCF and EPS keep their last-model-year share of revenue.
+    Returns (rows, EPS, fiscal years, extension growth rates %)."""
+    last = proj[-1]
+    prev = proj[-2]["revenue"] if len(proj) > 1 else None
+    g = (last["revenue"] / prev - 1) * 100 if pos(prev) and pos(last["revenue"]) else LONG_RUN_GROWTH
+    growth = fade(g, n)
+    rows, out_eps, scale = list(proj), list(eps), 1.0
+    for gk in growth:
+        scale *= 1 + gk / 100
+        rows.append({k: last[k] * scale for k in ("revenue", "ebitda", "fcf")})
+        out_eps.append(eps[-1] * scale if eps[-1] is not None else None)
+    return rows, out_eps, years + [years[-1] + j for j in range(1, n + 1)], growth
+
+
+def year_windows(base_end: pd.Timestamp, years: list[int], proj: list[dict], eps: list,
+                 today: dt.date | None = None) -> dict:
+    """The forward-12-month window at each year mark: Year k covers months 12k+1 … 12k+12 from today,
+    calendarized like the NTM window, using the fade extension where a window runs past the model."""
+    start = pd.Timestamp(today or dt.date.today())
+    rows, ext_eps, ext_years, growth = extend_projection(proj, eps, years)
+    wins = [forward_window(base_end, ext_years, rows, ext_eps, start + pd.DateOffset(months=12 * k))
+            for k in range(1, YEARS + 1)]
+    return {"windows": wins, "model_end": years[-1],
+            "extension": {y: g for y, g in zip(ext_years[len(years):], growth)
+                          if any(w and y in (yr for yr, _ in w["parts"]) for w in wins)}}
+
+
+def window_mix(parts: list, model_end: int | None = None) -> str:
+    """e.g. "17% FY2026E + 83% FY2027E" (weights sum to 100%); fade-extension years are marked."""
+    pcts = [round(w * 100) for _, w in parts]
     pcts[-1] = 100 - sum(pcts[:-1])
-    mix = " + ".join(f"{pct}% FY{year}E" for (year, _), pct in zip(ntm["parts"], pcts))
-    return f"12-month forward basis (to {ntm['end'].strftime('%b %Y')}): {mix}"
+    return " + ".join(f"{pct}% FY{year}E" + (" (fade ext.)" if model_end and year > model_end else "")
+                      for (year, _), pct in zip(parts, pcts))
+
+
+def ntm_basis_text(ntm: dict) -> str:
+    """e.g. "12-month forward basis (to Oct 2027): 17% FY2026E + 83% FY2027E"."""
+    return f"12-month forward basis (to {ntm['end'].strftime('%b %Y')}): {window_mix(ntm['parts'])}"
 
 def eps_caption(defaults: dict, years: list[int], eps: list, base: dict) -> str:
     """Where each EPS figure in the chart and table comes from."""
@@ -1897,7 +1939,7 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
     flows = [p["fcf"] for p in proj]
     if not pos(flows[-1]):
         st.warning(f"Projected {years[-1]} free cash flow is not positive, so a Gordon Growth terminal value is "
-                   "not meaningful. Adjust the margin / conversion assumptions, or use the P/S and EV/Adj. EBITDA "
+                   "not meaningful. Adjust the margin / conversion assumptions, or use the multiples price-target "
                    "methods below.")
         return None
     if not pos(shares):
@@ -1959,92 +2001,142 @@ def render_dcf(ticker: str, proj: list[dict] | None, years: list[int], net_debt,
     return implied if implied > 0 else None
 
 
-def render_price_targets(ticker, m, share_info: dict, net_debt, ntm: dict | None, base_fcf, base_label) -> list[tuple]:
-    """Render the Price Target Setter on a 12-month-forward basis, dividing by the same diluted share count
-    as the DCF. Returns [(method, target price)]."""
+def target_methods(m: dict, ntm: dict, shares: float) -> list[dict]:
+    """The applicable price-target methods: P/E (or P/S when NTM EPS is not positive) and P/FCF.
+    Each has one multiple, its default (today's multiple on a forward basis) and its per-share metric."""
+    mcap = pos(m["market_cap"])
+    methods = []
+    if pos(ntm["eps"]):
+        today = pos(m["pe_fwd"]) or pos(m["pe_ttm"])
+        basis = "forward P/E" if pos(m["pe_fwd"]) else "trailing P/E"
+        methods.append({"label": "P/E", "name": "pe_mult", "title": "Target P/E", "step": 0.5, "fallback": 15.0,
+                        "today": today, "metric": "EPS", "per_share": lambda w: w["eps"],
+                        "basis": f"today's {basis} ({today:,.1f}x)" if today else None,
+                        "missing": f"today's {basis} is unavailable or not meaningful"})
+    else:
+        today = safe_div(mcap, ntm["revenue"]) if mcap and pos(ntm["revenue"]) else None
+        methods.append({"label": "P/S", "name": "ps_mult", "title": "Target P/S", "step": 0.1, "fallback": 2.0,
+                        "today": today, "metric": "Revenue/share", "per_share": lambda w: w["revenue"] / shares,
+                        "basis": (f"market cap ÷ NTM revenue ({fmt_money(mcap)} ÷ {fmt_money(ntm['revenue'])} = "
+                                  f"{today:,.2f}x)") if today else None,
+                        "missing": "market cap ÷ NTM revenue is unavailable",
+                        "why": "Used instead of P/E because NTM EPS is not positive, so a P/E target is not meaningful."})
+    if pos(ntm["fcf"]):
+        today = safe_div(mcap, ntm["fcf"]) if mcap else None
+        today = today if today and today <= 100 else None
+        methods.append({"label": "P/FCF", "name": "pfcf_mult", "title": "Target Price / FCF", "step": 0.5,
+                        "fallback": 20.0, "today": today, "metric": "FCF/share",
+                        "per_share": lambda w: w["fcf"] / shares,
+                        "basis": (f"market cap ÷ NTM FCF ({fmt_money(mcap)} ÷ {fmt_money(ntm['fcf'])} = "
+                                  f"{today:,.1f}x)") if today else None,
+                        "missing": "market cap ÷ NTM FCF is unavailable or above 100x"})
+    for meth in methods:
+        meth["default"] = round(float(meth["today"] or meth["fallback"]), 2 if meth["step"] < 0.5 else 1)
+        meth["note"] = (f"Default = {meth['basis']}" if meth["basis"] else
+                        f"Default = {meth['fallback']:,.1f}x fallback ({meth['missing']})")
+    return methods
+
+
+def windows_basis_text(yw: dict) -> str:
+    """Each yearly window's months and fiscal-year weights, plus the fade extension when used."""
+    parts = []
+    for k, w in enumerate(yw["windows"], start=1):
+        months = f"months {12 * k + 1}–{12 * k + 12}"
+        parts.append(f"Year {k}: {months} ({w['start'].strftime('%b %Y')}–{w['end'].strftime('%b %Y')}) = "
+                     f"{window_mix(w['parts'], yw['model_end'])}" if w else f"Year {k}: {months} not covered")
+    text = "Yearly windows — " + "; ".join(parts) + "."
+    ext = yw["extension"]
+    if ext:
+        rates = ", ".join(f"FY{y}E {g:.1f}%" for y, g in ext.items())
+        text += (f" Windows past FY{yw['model_end']}E are calendarized with an internal fade extension that is not "
+                 f"part of the model or the DCF: revenue growth keeps fading toward {LONG_RUN_GROWTH:.0f}% ({rates}), "
+                 "and Adj. EBITDA, FCF and EPS keep their final-model-year share of revenue.")
+    return text
+
+
+def render_price_targets(ticker, m, share_info: dict, ntm: dict | None, yw: dict | None) -> list[tuple]:
+    """Render the Price Target Setter: one multiple per method, applied to the forward-12-month figures at
+    each of the five year marks, dividing by the same diluted share count as the DCF.
+    Returns [(method, Year-1 target price)] for the Summary."""
     shares = share_info["count"]
     st.header("Price Target Setter")
     price = m["price"]
     results: list[tuple] = []
-    if not ntm:
-        st.warning("The projection model is unavailable, so 12-month-forward targets cannot be computed.")
+    if not ntm or not yw:
+        st.warning("The projection model is unavailable, so forward price targets cannot be computed.")
         return results
     if not pos(shares):
         st.warning("Shares outstanding unavailable — per-share targets cannot be computed.")
         return results
 
     st.markdown(f"**{ntm_basis_text(ntm)}**")
-    cols = st.columns(4)
+    cols = st.columns(3)
     cols[0].metric("NTM revenue", fmt_money(ntm["revenue"]))
-    cols[1].metric("NTM Adj. EBITDA", fmt_money(ntm["ebitda"]))
-    cols[2].metric("NTM free cash flow", fmt_money(ntm["fcf"]))
-    cols[3].metric("NTM EPS (diluted)", fmt_price(ntm["eps"]))
-    st.caption("NTM = next twelve months from today, calendarized from your projections in the model above. "
-               "Every method below applies a target multiple to these NTM figures, so each result is a "
-               "12-month price target. Target multiples default to the company's multiple today. Per-share "
-               f"targets divide by {shares / 1e6:,.1f}M shares ({share_info['source']}), the same count as the DCF.")
+    cols[1].metric("NTM free cash flow", fmt_money(ntm["fcf"]))
+    cols[2].metric("NTM EPS (diluted)", fmt_price(ntm["eps"]))
+    st.caption("NTM = next twelve months from today, calendarized from your projections in the model above; the "
+               "default P/FCF (and P/S) multiple is market cap ÷ these NTM figures, so it is on a forward basis. "
+               "Each method applies its one target multiple to the forward-12-month figures at each year mark: "
+               "Year k uses months 12k+1 to 12k+12 from today, so Year 1 (months 13–24) is the forward year the "
+               "market will price in 12 months and is the 12-month price target. Per-share targets divide by "
+               f"{shares / 1e6:,.1f}M shares ({share_info['source']}), the same count as the DCF.")
 
-    on_fallback = [False]  # the last multiple is the generic fallback, not today's multiple or the user's own
+    methods = target_methods(m, ntm, shares)
+    registry = st.session_state.setdefault(f"_defaults_{ticker}", {})
+    for meth in methods:
+        key = input_key(ticker, meth["name"])
+        prev = registry.get(meth["name"])
+        # A box still at its previous default follows the default when the model moves it (e.g. after a reset
+        # or an edited growth path changes NTM FCF); an edited box is kept.
+        if key in st.session_state and prev is not None and not _same(prev, meth["default"]) \
+                and _same(st.session_state[key], prev):
+            st.session_state[key] = meth["default"]
+        meth["key"] = seed_input(ticker, meth["name"], meth["default"], lo=0.0)
 
-    def target_input(label: str, name: str, today_value, fallback: float, basis: str, step: float) -> float:
-        today_value = pos(today_value)
-        default = round(float(today_value or fallback), 2 if step < 0.5 else 1)
-        note = (f"Default = today's {basis} ({today_value:,.1f}x)" if today_value
-                else f"Default = {fallback:,.1f}x fallback (today's {basis} is unavailable or not meaningful)")
-        value = st.number_input(label, min_value=0.0, step=step, help=note,
-                                **bound(seed_input(ticker, name, default, lo=0.0)))
-        st.caption(note)
-        on_fallback[0] = not today_value and _same(value, default)
-        return value
+    labels = [meth["label"] for meth in methods]
+    sel_key = f"pt_method_{ticker}"
+    if st.session_state.get(sel_key) not in labels:
+        st.session_state[sel_key] = labels[0]
+    st.segmented_control("Method", labels, required=True, key=sel_key, default=st.session_state[sel_key])
 
-    def show(label: str, target: float, formula: str):
+    for meth in methods:
+        selected = meth["label"] == st.session_state[sel_key]
+        if selected:
+            if meth.get("why"):
+                st.caption(meth["why"])
+            st.number_input(meth["title"], min_value=0.0, step=meth["step"], help=md_escape(meth["note"]),
+                            **bound(meth["key"]))
+            st.caption(md_escape(meth["note"]))
+        else:  # Streamlit drops the state of widgets that are not drawn, so carry the hidden method's multiple
+            st.session_state[meth["key"]] = st.session_state[meth["key"]]
+        mult = st.session_state[meth["key"]]
         # Without a current price, a target on the generic fallback multiple is not a real target: it is
         # labelled illustrative and kept out of the Summary.
-        illustrative = not pos(price) and on_fallback[0]
-        col1, col2 = st.columns([1, 2])
-        up = upside(target, price)
-        col1.metric(f"{label} 12-month target" + (" (illustrative)" if illustrative else ""),
-                    fmt_price(target) if target > 0 else "N/A",
-                    delta=fmt_pct(up, signed=True) + " vs current" if up is not None and target > 0 else None)
-        col2.markdown(f"<br/>{formula}", unsafe_allow_html=True)
+        illustrative = not pos(price) and not meth["today"] and _same(mult, meth["default"])
+        cells = []
+        for w in yw["windows"]:
+            metric = meth["per_share"](w) if w else None
+            cells.append((metric, metric * mult if metric is not None and metric > 0 else None))
+        if cells[0][1] and not illustrative:
+            results.append((meth["label"], cells[0][1]))
+        if not selected:
+            continue
+        with st.container(key="grid_pt"):
+            for k, (col, (metric, target)) in enumerate(zip(st.columns(YEARS), cells), start=1):
+                up = upside(target, price) if target else None
+                col.metric(f"Year {k}" + (" (illustrative)" if illustrative else ""), fmt_price(target),
+                           delta=fmt_pct(up, signed=True) + " vs current" if up is not None else None,
+                           help=f"Months {12 * k + 1}–{12 * k + 12} from today")
+                col.caption(md_escape(f"{meth['metric']} {fmt_price(metric)} · mo {12 * k + 1}–{12 * k + 12}"))
+        fmt_m = f"{mult:,.2f}" if meth["step"] < 0.5 else f"{mult:,.1f}"
+        st.caption(md_escape(f"Target = {meth['metric']} for the year's window × {fmt_m}x {meth['label']} "
+                             "(one multiple for all five years). " + windows_basis_text(yw)))
         if illustrative:
             st.caption("Illustrative — based on a fallback multiple, current price unavailable. Not included in the "
                        "Summary.")
-        elif target > 0:
-            results.append((label, target))
-        else:
-            st.warning(f"{label}: inputs produce a non-positive price, excluded from the summary.")
-
-    per_share = f"{shares / 1e6:,.1f}M {'diluted ' if share_info['diluted'] else ''}shares"
-    if pos(ntm["eps"]):
-        st.subheader("P/E method")
-        mult = target_input("Target P/E", "pe_mult", pos(m["pe_fwd"]) or pos(m["pe_ttm"]), 15.0,
-                            "forward P/E" if pos(m["pe_fwd"]) else "trailing P/E", 0.5)
-        show("P/E", ntm["eps"] * mult, f"`{fmt_price(ntm['eps'])} NTM EPS × {mult:,.1f} P/E`")
-    else:
-        st.subheader("P/S method")
-        st.caption("Used because NTM EPS is not positive, so a P/E target is not meaningful.")
-        mult = target_input("Target P/S", "ps_mult", m["ps"], 2.0, "P/S (TTM revenue)", 0.1)
-        show("P/S", ntm["revenue"] / shares * mult,
-             f"`({fmt_money(ntm['revenue'])} NTM revenue ÷ {per_share}) × {mult:,.2f} P/S`")
-
-    if pos(ntm["ebitda"]):
-        st.subheader("EV / Adj. EBITDA method")
-        mult = target_input("Target EV/Adj. EBITDA", "ev_mult", m["ev_ebitda"], 12.0,
-                            "EV / TTM Adjusted EBITDA", 0.5)
-        nd = net_debt or 0.0
-        # Subtracting net debt; with net cash (negative net debt) that is an addition.
-        bridge = f"− net debt of {fmt_money(nd)}" if nd >= 0 else f"+ net cash of {fmt_money(-nd)}"
-        show("EV/Adj. EBITDA", (ntm["ebitda"] * mult - nd) / shares,
-             f"`({fmt_money(ntm['ebitda'])} NTM Adj. EBITDA × {mult:,.1f} {bridge}) ÷ {per_share}`")
-
-    if pos(ntm["fcf"]):
-        st.subheader("Price / FCF method")
-        today_pfcf = safe_div(m["market_cap"], base_fcf) if pos(base_fcf) else None
-        mult = target_input("Target Price / FCF", "pfcf_mult", today_pfcf if today_pfcf and today_pfcf <= 100 else None,
-                            20.0, f"Price / FCF (market cap ÷ {base_label} FCF)", 0.5)
-        show("P/FCF", ntm["fcf"] / shares * mult,
-             f"`({fmt_money(ntm['fcf'])} NTM FCF ÷ {per_share}) × {mult:,.1f} P/FCF`")
+        elif not cells[0][1]:
+            st.warning(f"{meth['label']}: the Year-1 {meth['metric']} is not positive, so this method is excluded "
+                       "from the Summary.")
     return results
 
 
@@ -2067,11 +2159,13 @@ def render_summary(dcf_price: float | None, multiples: list[tuple], price) -> No
             names = ", ".join(n for n, _ in multiples)
             target = sum(p for _, p in multiples) / len(multiples)
             st.markdown("**12-Month Price Target — multiples average**")
-            label, note = "12-month target (average)", f"Simple average of {len(multiples)} NTM methods: {names}."
+            label, note = "12-month target (average)", (f"Simple average of the Year-1 targets (months 13–24 "
+                                                         f"forward window) of {len(multiples)} methods: {names}.")
         elif len(multiples) == 1:
             name, target = multiples[0]
             st.markdown(f"**12-Month Price Target — {name}**")
-            label, note = f"12-month target ({name})", f"{name} is the only multiples method that applies, so this is its value."
+            label, note = f"12-month target ({name})", (f"{name} is the only multiples method that applies, so this is "
+                                                        "its Year-1 target (months 13–24 forward window).")
         else:
             target = None
             st.markdown("**12-Month Price Target**")
@@ -2084,7 +2178,7 @@ def render_summary(dcf_price: float | None, multiples: list[tuple], price) -> No
         st.caption(note)
 
     rows = ([("DCF", "Intrinsic value today", dcf_price)] if dcf_price else []) + \
-           [(n, "12-month target (NTM)", p) for n, p in multiples]
+           [(n, "12-month target (Year 1)", p) for n, p in multiples]
     if rows:
         st.dataframe(pd.DataFrame(
             [{"Method": n, "Horizon": h, "Target price": fmt_price(p),
@@ -2113,7 +2207,7 @@ def render_how_it_works() -> None:
         st.latex(r"FCF_0 = \text{Operating Cash Flow} - \text{Capex}")
         st.latex(r"\text{Adjusted EBITDA} = \text{EBITDA (excl. unusual items)} + "
                  r"\text{Stock-Based Compensation}")
-        st.markdown("Adjusted EBITDA is used everywhere EBITDA appears (model, margins, EV/Adj. EBITDA, FCF "
+        st.markdown("Adjusted EBITDA is used everywhere EBITDA appears (model, margins, snapshot EV/Adj. EBITDA, FCF "
                     "conversion). " f"The EBITDA part is the normalized EBITDA from {provider}, "
                     "or its reported EBITDA when no normalized figure exists. For the base year the stock-based "
                     "compensation add-back is SEC EDGAR's ShareBasedCompensation, disclosed in the model "
@@ -2180,17 +2274,24 @@ def render_how_it_works() -> None:
                     "with 2 months left in FY1 and 10 months in FY2 is 17% FY1 + 83% FY2.")
         st.latex(r"X_{NTM} = \sum_{t} w_t \, X_t \qquad w_t = \frac{\text{days of FY}_t \text{ inside the window}}"
                  r"{\text{days in the window}} \qquad X \in \{Revenue,\ Adj.\ EBITDA,\ FCF,\ EPS\}")
-        st.markdown("**12-month price targets** (target multiples default to the company's multiple today)")
-        st.latex(r"\text{P/E} = EPS_{NTM} \times \text{Target P/E} \quad (EPS_{NTM} > 0)")
-        st.latex(r"\text{P/S} = \frac{Revenue_{NTM}}{\text{Shares}} \times \text{Target P/S} "
+        st.markdown("**Yearly price targets.** Each method has one target multiple, applied to all five years. "
+                    "Year k's target uses the forward-12-month window at the year-k mark, months 12k+1 to 12k+12 "
+                    "from today, calendarized the same way as NTM. Windows that run past the model's last year use "
+                    f"an internal fade extension (growth keeps fading toward {LONG_RUN_GROWTH:.0f}%, other figures keep "
+                    "their final-year share of revenue) for calendarization only; it is not shown or valued. Default "
+                    "multiples are on a forward basis: today's forward P/E, and market cap ÷ NTM FCF (or NTM revenue "
+                    "for P/S). A box still at its default follows the default when the model changes it; an edited "
+                    "box is kept.")
+        st.latex(r"\text{P/E}_k = EPS_{W_k} \times \text{Target P/E} \quad (EPS_{NTM} > 0)")
+        st.latex(r"\text{P/S}_k = \frac{Revenue_{W_k}}{\text{Shares}} \times \text{Target P/S} "
                  r"\quad (\text{used when } EPS_{NTM} \le 0)")
-        st.latex(r"\text{EV/Adj. EBITDA} = \frac{\text{Adj. EBITDA}_{NTM} \times \text{Target multiple} "
-                 r"- \text{Net Debt}}{\text{Shares}} \quad (\text{Adj. EBITDA}_{NTM} > 0)")
-        st.latex(r"\text{P/FCF} = \frac{FCF_{NTM}}{\text{Shares}} \times \text{Target P/FCF} \quad (FCF_{NTM} > 0)")
-        st.markdown("**Horizons.** The DCF gives intrinsic value *today*. The multiples methods give a *12-month* "
-                    "price target; when two or more apply, the 12-month target is their simple average, and when "
-                    "only one applies it is that method's value. The blended line averages all methods and mixes "
-                    "both horizons, so it is shown only as a secondary reference.")
+        st.latex(r"\text{P/FCF}_k = \frac{FCF_{W_k}}{\text{Shares}} \times \text{Target P/FCF} \quad (FCF_{NTM} > 0)")
+        st.latex(r"W_k = \text{months } 12k+1 \ldots 12k+12 \qquad "
+                 r"\text{P/FCF}_{\text{default}} = \frac{\text{Mkt Cap}}{FCF_{NTM}}")
+        st.markdown("**Horizons.** The DCF gives intrinsic value *today*. The 12-month price target is the multiples "
+                    "methods' Year-1 target; when two or more apply, it is their simple average, and when only one "
+                    "applies it is that method's Year-1 value. The blended line averages the DCF with those Year-1 "
+                    "targets and mixes both horizons, so it is shown only as a secondary reference.")
         st.markdown("**Snapshot multiples**")
         st.latex(r"P/E = \frac{Price}{EPS} \quad PEG = \frac{P/E}{\text{EPS growth (\%)}} \quad "
                  r"P/S = \frac{\text{Mkt Cap}}{\text{Revenue}} \quad P/B = \frac{Price}{\text{Book/Share}}")
@@ -2718,7 +2819,8 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
 
     # ---- 5. Price targets (12-month forward)
     ntm = ntm_figures(base["end"], years, proj, eps) if proj else None
-    multiples = render_price_targets(ticker, m, share_info, net_debt, ntm, base["fcf"], base["label"])
+    yw = year_windows(base["end"], years, proj, eps) if proj else None
+    multiples = render_price_targets(ticker, m, share_info, ntm, yw)
 
     # ---- 6. Summary
     render_summary(dcf_price, multiples, price)
@@ -2791,6 +2893,15 @@ APP_CSS = f"""
     .st-key-conv_row [data-testid="stColumn"], .st-key-pf_rows [data-testid="stColumn"] {{
         min-width: 0 !important; width: auto !important; flex: 1 1 0 !important; }}
     .st-key-conv_row [data-testid="stColumn"]:last-child {{ display: none !important; }}
+}}
+
+/* Yearly price targets: five across on desktop (the year-grid CSS wraps them 3 + 2 on phones) */
+.st-key-grid_pt [data-testid="stMetricValue"] {{ font-size: 1.35rem; }}
+.st-key-grid_pt [data-testid="stMetricDelta"] {{ font-size: 0.8rem; }}
+@media (max-width: 767px) {{  /* narrow cells: the "% vs current" badge wraps instead of being cut off */
+    .st-key-grid_pt [data-testid="stMetricDelta"], .st-key-grid_pt [data-testid="stMetricDelta"] * {{
+        white-space: normal !important; overflow: visible !important; text-overflow: clip !important;
+        height: auto !important; }}
 }}
 
 /* Four-across tiles on desktop (two on phones) */
