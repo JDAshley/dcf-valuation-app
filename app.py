@@ -621,7 +621,7 @@ MARKET_KEYS = [
     "name", "sector", "industry", "currency", "price", "market_cap", "shares",
     "eps_ttm", "eps_fwd", "pe_ttm", "pe_fwd", "peg", "ps", "pb", "ev",
     "ev_sales", "ev_ebitda", "ebitda", "revenue_ttm", "fcf_ttm", "div_yield",
-    "total_debt", "total_cash", "estimates", "annual", "ttm",
+    "total_debt", "total_cash", "estimates", "annual", "ttm", "peg_growth",
 ]
 
 
@@ -695,6 +695,12 @@ def resilient(fetch, *args, default=None):
 
 
 @st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def peg_growth(pe, peg, basis: str) -> tuple[float, str] | None:
+    """The EPS growth rate (%) behind a provider's PEG ratio: its P/E ÷ PEG, with where it comes from."""
+    g = safe_div(pe, peg) if pos(pe) and pos(peg) else None
+    return (g, f"implied by {basis}") if g else None
+
+
 def fmp_market_data(symbol: str, api_key: str) -> dict:
     profile = _first(_fmp_get("profile", symbol, api_key))
     if not profile or num(_pick(profile, "price")) is None:
@@ -758,6 +764,8 @@ def fmp_market_data(symbol: str, api_key: str) -> dict:
         "eps_fwd": eps_fwd,
         "pe_ttm": pe,
         "peg": num(_pick(ratios, "priceToEarningsGrowthRatioTTM", "pegRatioTTM")),
+        "peg_growth": peg_growth(pe, num(_pick(ratios, "priceToEarningsGrowthRatioTTM", "pegRatioTTM")),
+                                 "Financial Modeling Prep's PEG (its TTM P/E ÷ PEG)"),
         "ps": ps,
         "pb": num(_pick(ratios, "priceToBookRatioTTM")),
         "ev": ev,
@@ -803,6 +811,10 @@ def yf_market_data(symbol: str) -> dict:
         "pe_ttm": num(info.get("trailingPE")),
         "pe_fwd": num(info.get("forwardPE")),
         "peg": num(_pick(info, "trailingPegRatio", "pegRatio")),
+        "peg_growth": peg_growth(num(info.get("trailingPE")), num(info.get("trailingPegRatio")),
+                                 "yfinance's trailing PEG (its trailing P/E ÷ PEG)")
+                      or peg_growth(num(info.get("forwardPE")), num(info.get("pegRatio")),
+                                    "yfinance's forward PEG (its forward P/E ÷ PEG)"),
         "ps": num(info.get("priceToSalesTrailing12Months")),
         "pb": num(info.get("priceToBook")),
         "ev": num(info.get("enterpriseValue")),
@@ -1591,11 +1603,16 @@ def lookup_cik(ticker: str) -> int | None:
 
 def render_snapshot(m: dict, fcf_for_yield: float | None, price, trailing: dict) -> None:
     st.header("Valuation Snapshot")
-    eps_neg = m["eps_ttm"] is not None and m["eps_ttm"] <= 0
+    # PEG uses the same TTM EPS (and so the same trailing P/E) as the Trailing P/E tile; PEG (fwd) uses the
+    # forward P/E behind the P/E target default. Both divide by the same growth rate.
+    growth, growth_basis = m.get("peg_growth") or (None, None)
+    peg = trailing["pe"] / growth if pos(trailing["eps"]) and pos(trailing["pe"]) and pos(growth) else None
+    peg_fwd = m["pe_fwd"] / growth if pos(m["eps_fwd"]) and pos(m["pe_fwd"]) and pos(growth) else None
     items = [
         ("Trailing P/E", "N/A" if trailing["eps"] is not None and trailing["eps"] <= 0 else fmt_mult(trailing["pe"])),
         ("Forward P/E", "N/A" if not pos(m["eps_fwd"]) else fmt_mult(m["pe_fwd"])),
-        ("PEG", "N/A" if eps_neg else fmt_mult(m["peg"])),
+        ("PEG", fmt_mult(peg) if peg else "N/A"),
+        ("PEG (fwd)", fmt_mult(peg_fwd) if peg_fwd else "N/A"),
         ("Price / Sales", fmt_mult(m["ps"])),
         ("Price / Book", fmt_mult(m["pb"])),
         ("EV / Sales", fmt_mult(m["ev_sales"])),
@@ -1613,11 +1630,16 @@ def render_snapshot(m: dict, fcf_for_yield: float | None, price, trailing: dict)
                 col.metric(label, value)
     with st.container(key="mob_snapshot"):
         tiles = [("Current price", fmt_price(price)), ("Market cap", fmt_money(m["market_cap"]))]
-        tiles += [("PEG ratio" if label == "PEG" else label, value) for label, value in items[:-1]]
-        tiles.append((items[-1][0], items[-1][1], "wide"))  # Dividend Yield spans both columns
+        tiles += items[:-1]
+        # Dividend Yield spans both columns when it would otherwise sit alone on the last row.
+        tiles.append((*items[-1], "wide") if len(tiles) % 2 == 0 else items[-1])
         st.html(tile_grid(tiles))
     st.caption("Multiples show N/A when the underlying earnings, EBITDA or book value is negative or unavailable. "
-               + md_escape(f"Trailing P/E = price ÷ {trailing['note']}"))
+               + md_escape(f"Trailing P/E = price ÷ {trailing['note']} "
+                           + (f"PEG = that trailing P/E ({trailing['label']}) ÷ {growth:.1f}% EPS growth; PEG (fwd) = "
+                              f"forward P/E (price ÷ consensus forward EPS) ÷ the same {growth:.1f}% — growth "
+                              f"{growth_basis}." if pos(growth)
+                              else "PEG and PEG (fwd) are N/A: no EPS growth rate is available.")))
 
 
 DEFAULT_MODES = ["Consensus", "Upper-range"]
@@ -2358,7 +2380,10 @@ def render_how_it_works() -> None:
                     "the diluted share count the DCF uses. It is cross-checked against the sum of the same quarters' "
                     "reported diluted EPS; if they differ by more than 10%, either is unavailable (fewer than four "
                     f"quarters, e.g. a 20-F filer) or the latest quarter is over {TTM_STALE_DAYS} days old, the provider's "
-                    "TTM EPS is used instead. The caption under the snapshot names the source.")
+                    "TTM EPS is used instead. The caption under the snapshot names the source. PEG = that same "
+                    "trailing P/E ÷ the EPS growth rate implied by the provider's PEG (its own P/E ÷ PEG), else "
+                    "consensus forward EPS ÷ TTM EPS − 1; PEG (fwd) = forward P/E ÷ the same growth rate. Each is N/A "
+                    "when its EPS or the growth rate is not positive.")
         st.latex(r"P/E = \frac{Price}{EPS} \quad PEG = \frac{P/E}{\text{EPS growth (\%)}} \quad "
                  r"P/S = \frac{\text{Mkt Cap}}{\text{Revenue}} \quad P/B = \frac{Price}{\text{Book/Share}}")
         st.latex(r"EV = \text{Mkt Cap} + \text{Debt} - \text{Cash} \quad EV/Sales \quad EV/EBITDA \quad "
@@ -2809,6 +2834,9 @@ def render_ticker(ticker: str, m: dict, source: str, warnings: list, edgar: dict
     if m["peg"] is None and pos(eps_ttm) and pos(m["eps_fwd"]) and pos(m["pe_ttm"]):
         eps_growth = (m["eps_fwd"] / eps_ttm - 1) * 100
         m["peg"] = m["pe_ttm"] / eps_growth if eps_growth > 0 else None
+    if m["peg_growth"] is None and pos(eps_ttm) and pos(m["eps_fwd"]):
+        eps_growth = (m["eps_fwd"] / eps_ttm - 1) * 100
+        m["peg_growth"] = (eps_growth, "consensus forward EPS ÷ TTM EPS − 1") if eps_growth > 0 else None
     m["eps_ttm"] = eps_ttm
 
     # ---- 1. Header
